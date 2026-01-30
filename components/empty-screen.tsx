@@ -16,7 +16,12 @@ const exampleMessages = [
   {
     heading: 'ask for your timetable',
     message: `Give me the time table for 1st year CSE branch: \n`
-  }
+  },
+  {
+    heading: 'ask for your syllabus',
+    message: `Give me the syllabus of unit 1 of information security \n`
+  },
+
 ]
 
 export function EmptyScreen({ setInput }: Pick<UseChatHelpers, 'setInput'>) {

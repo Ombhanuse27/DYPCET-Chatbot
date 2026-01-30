@@ -1,12 +1,218 @@
 import Groq from "groq-sdk";
+import mysql from "mysql2/promise";
+import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.js';
+import fs from 'fs';
+import path from 'path';
+
+// ✅ FIX: This prevents PDF.js from looking for the 'canvas' module in Node.js
+const PDFJS_CONFIG = {
+  disableRange: true,
+  disableStream: true,
+  disableAutoFetch: true,
+};
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = path.join(
+  process.cwd(), 
+  'node_modules/pdfjs-dist/legacy/build/pdf.worker.js'
+);
+
+// export const runtime = 'edge'
+
+
+export const get_syllabus_from_pdf = async ({ 
+  subject, 
+  unit 
+}: { 
+  subject: string; 
+  unit: string 
+}) => {
+  try {
+    const syllabusPath = path.join(process.cwd(), 'public/TY-CSE-syllabus.pdf');
+    
+    if (!fs.existsSync(syllabusPath)) {
+      throw new Error(`Syllabus file not found at ${syllabusPath}`);
+    }
+
+    const data = new Uint8Array(fs.readFileSync(syllabusPath));
+    const pdf = await pdfjsLib.getDocument({ data, disableWorker: true }).promise;
+
+    let fullText = '';
+    let pageTexts: string[] = [];
+    
+    // Extract text with better formatting preservation
+    for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+      const page = await pdf.getPage(pageNum);
+      const content = await page.getTextContent();
+      
+      // Sort items by vertical position to maintain reading order
+      const items = content.items.sort((a: any, b: any) => {
+        const yDiff = Math.abs(a.transform[5] - b.transform[5]);
+        if (yDiff > 5) return b.transform[5] - a.transform[5]; // Top to bottom
+        return a.transform[4] - b.transform[4]; // Left to right
+      });
+      
+      let currentY = -1;
+      let lineText = '';
+      let pageText = '';
+      
+      items.forEach((item: any) => {
+        const y = item.transform[5];
+        const text = item.str;
+        
+        // New line detection
+        if (currentY !== -1 && Math.abs(currentY - y) > 5) {
+          pageText += lineText.trim() + '\n';
+          lineText = '';
+        }
+        
+        lineText += text + ' ';
+        currentY = y;
+      });
+      
+      pageText += lineText.trim();
+      pageTexts.push(pageText);
+      fullText += pageText + '\n\n';
+    }
+
+    console.log(`🔍 Searching for: "${subject}" - Unit ${unit}`);
+
+    // Normalize subject name for better matching
+    const normalizeSubject = (str: string) => {
+      return str.toLowerCase()
+        .replace(/[^\w\s]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    };
+
+    const normalizedSearchSubject = normalizeSubject(subject);
+    
+    // Try multiple subject matching patterns
+    const subjectPatterns = [
+      new RegExp(`Course\\s+Title\\s*:?\\s*${subject}`, 'i'),
+      new RegExp(`${subject}`, 'i'),
+      new RegExp(subject.split(' ').join('\\s+'), 'i'),
+    ];
+
+    let subjectStartIndex = -1;
+    let matchedPattern = null;
+
+    // Find the subject in the text
+    for (const pattern of subjectPatterns) {
+      const match = fullText.match(pattern);
+      if (match) {
+        subjectStartIndex = match.index!;
+        matchedPattern = pattern;
+        break;
+      }
+    }
+
+    if (subjectStartIndex === -1) {
+      // Try fuzzy matching on each line
+      const lines = fullText.split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        if (normalizeSubject(lines[i]).includes(normalizedSearchSubject)) {
+          subjectStartIndex = fullText.indexOf(lines[i]);
+          break;
+        }
+      }
+    }
+
+    if (subjectStartIndex === -1) {
+      return `❌ **Subject "${subject}" not found** in the syllabus.\n\n💡 **Tip:** Try checking the exact subject name or browse the available subjects.`;
+    }
+
+    // Extract content after subject match
+    const afterSubject = fullText.slice(subjectStartIndex);
+    
+    // Find the next subject/course to limit our search
+    const nextCourseMatch = afterSubject.slice(100).match(/Course\s+Title\s*:?/i);
+    const searchableText = nextCourseMatch 
+      ? afterSubject.slice(0, 100 + nextCourseMatch.index!)
+      : afterSubject.slice(0, 5000);
+
+    // Multiple unit matching patterns
+    const unitPatterns = [
+      // Pattern 1: "Unit 1:" or "Unit I:"
+      new RegExp(
+        `Unit[\\s-]*${unit}\\s*:([\\s\\S]+?)(?=Unit[\\s-]*(?:\\d+|[IVX]+)\\s*:|Course\\s+Outcomes|Text\\s+Books?|References?|$)`,
+        'i'
+      ),
+      // Pattern 2: "UNIT 1" or "UNIT-1"
+      new RegExp(
+        `UNIT[\\s-]*${unit}([\\s\\S]+?)(?=UNIT[\\s-]*(?:\\d+|[IVX]+)|Course\\s+Outcomes|Text\\s+Books?|References?|$)`,
+        'i'
+      ),
+      // Pattern 3: Roman numerals (I, II, III, IV, V, VI)
+      new RegExp(
+        `Unit[\\s-]*${convertToRoman(unit)}\\s*:?([\\s\\S]+?)(?=Unit[\\s-]*(?:\\d+|[IVX]+)|Course\\s+Outcomes|Text\\s+Books?|References?|$)`,
+        'i'
+      ),
+    ];
+
+    let unitContent = null;
+    let matchedUnitPattern = null;
+
+    for (const pattern of unitPatterns) {
+      const match = searchableText.match(pattern);
+      if (match && match[1]) {
+        unitContent = match[1];
+        matchedUnitPattern = pattern;
+        break;
+      }
+    }
+
+    if (!unitContent) {
+      return `❌ **Unit ${unit} not found** for ${subject}.\n\n💡 **Available units:** Usually 1-6. Please verify the unit number.`;
+    }
+
+    // Clean and format the content
+    let cleanedContent = unitContent
+      .trim()
+      .replace(/\s+/g, ' ') // Normalize whitespace
+      .replace(/(\d+)\s+Hours?/gi, '**$1 Hours**') // Bold hours
+      .replace(/^\s*[:;-]\s*/gm, '') // Remove leading punctuation
+      .slice(0, 2000); // Limit length
+
+    // Try to extract topics/subtopics
+    const lines = cleanedContent.split(/[,;]/).filter(l => l.trim().length > 5);
+    
+    let formattedContent = '';
+    if (lines.length > 1) {
+      formattedContent = '**Topics Covered:**\n\n';
+      lines.forEach((line, idx) => {
+        const trimmedLine = line.trim();
+        if (trimmedLine) {
+          formattedContent += `${idx + 1}. ${trimmedLine}\n`;
+        }
+      });
+    } else {
+      formattedContent = cleanedContent;
+    }
+
+    // Extract hours if present
+    const hoursMatch = unitContent.match(/(\d+)\s*Hours?/i);
+    const hours = hoursMatch ? `\n\n⏱️ **Duration:** ${hoursMatch[1]} Hours` : '';
+
+    return `# 📘 ${subject}\n## Unit ${unit}\n\n${formattedContent}${hours}`;
+    
+  } catch (err: any) {
+    console.error('PDF parsing error:', err);
+    return `⚠️ **Error processing PDF:** ${err.message}\n\nPlease ensure the syllabus file is properly formatted.`;
+  }
+};
+
+// Helper function to convert numbers to Roman numerals
+function convertToRoman(num: string): string {
+  const romanNumerals: { [key: string]: string } = {
+    '1': 'I', '2': 'II', '3': 'III', '4': 'IV',
+    '5': 'V', '6': 'VI', '7': 'VII', '8': 'VIII'
+  };
+  return romanNumerals[num] || num;
+}
 
 export const runtime = 'nodejs';
 
-
-import mysql from "mysql2/promise";
-// export const runtime = 'edge'
-
-const groq = new Groq({ apiKey: "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" });
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY! });
 
 const db = mysql.createPool({
   host: 'localhost',
@@ -103,8 +309,34 @@ const tools = [
         required: ["year", "branch"]
       }
     }
-  }
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "get_syllabus_from_pdf",
+      description: "Extract unit-wise syllabus from a given subject in the syllabus PDF.",
+      parameters: {
+        type: "object",
+        properties: {
+          subject: {
+            type: "string",
+            description: "The subject name, e.g., 'Compiler Design'"
+          },
+          unit: {
+            type: "string",
+            description: "The unit number, e.g., '1', '2', etc."
+          }
+        },
+        required: ["subject", "unit"]
+      }
+    }
+  }  
 ];
+
+
+
+
+
 
 
 const systemMessage = {
@@ -131,6 +363,14 @@ const systemMessage = {
     If a question is unrelated to the college or your capabilities, politely decline to answer and guide the user accordingly.
 
     Do not share or assume private data unless explicitly provided by the user.
+
+    ⚠️ Important: When requesting timetable, always convert year to integer (1,2,3,4) and branch to exact database name ("Computer Science", "Mechanical", "Civil", etc.) before calling get_timetable.
+
+    Special instruction for syllabus requests:
+
+  - When the user requests a unit syllabus, after fetching it from the PDF, generate **custom study tips dynamically** based on the topics extracted.
+  - The study tips should include: important points to focus on, example/problem practice advice, and revision strategies.
+  - Make the tips concise, actionable, and relevant to the specific syllabus unit.
 
     Stay concise, but helpful.
 
@@ -200,18 +440,22 @@ You have access to the following tools:
 const availableFunctions: Record<string, Function> = {
   get_attendance,
   get_timetable,
+  get_syllabus_from_pdf,
+
 };
 
 
 export async function POST(req: Request) {
-
-  const { messages } = await req.json()
-  console.log()
-  console.log("user input:", messages[messages.length - 1].content);
-  console.log()
+  const { messages } = await req.json();
+  const userMessage = messages[messages.length - 1].content;
+  console.log("\nUser input:", userMessage, "\n");
 
   const updatedMessages = [systemMessage, ...messages];
 
+
+
+
+  // Otherwise, call the main LLM to decide tool usage
   const response = await groq.chat.completions.create({
     model: "llama-3.3-70b-versatile",
     messages: updatedMessages,
@@ -220,34 +464,17 @@ export async function POST(req: Request) {
     max_tokens: 4096,
   });
 
-  const responseMessage = response.choices[0].message
+  const responseMessage = response.choices[0].message;
   const toolCalls = responseMessage.tool_calls;
-  console.log()
-  if(responseMessage.content != undefined){
-    console.log("First LLM Call Response: ", responseMessage.content)
-  }else{
-    console.log("using of tools decided by LLM" )
-  }
-  console.log()
-  if (responseMessage.content == undefined) {
-    console.log("tool calls: ")
-    console.log(toolCalls)
-  }
-  if (toolCalls && toolCalls.length > 0) {
-    // Add assistant's tool call message
-    updatedMessages.push({
-      role: "assistant",
-      tool_calls: toolCalls.map((toolCall) => ({
-        id: toolCall.id,
-        function: {
-          name: toolCall.function.name,
-          arguments: toolCall.function.arguments,
-        },
-        type: toolCall.type,
-      })),
-    });
 
-    // Call each tool and push results
+  if (responseMessage.content != undefined) {
+    console.log("First LLM Call Response:", responseMessage.content);
+  } else {
+    console.log("LLM decided to use tools.");
+  }
+
+  // Handle tool calls
+  if (toolCalls && toolCalls.length > 0) {
     for (const toolCall of toolCalls) {
       const functionName = toolCall.function.name;
       const func = availableFunctions[functionName];
@@ -255,61 +482,54 @@ export async function POST(req: Request) {
 
       const functionArgs = JSON.parse(toolCall.function.arguments);
       const functionResponse = await func(functionArgs);
-      console.log(`Tool ${functionName} response: `, functionResponse);
+      console.log(`Tool ${functionName} response:`, functionResponse);
 
+      // ✅ For syllabus, return directly without a second LLM call
+      if (functionName === "get_syllabus_from_pdf") {
+        return new Response(
+          JSON.stringify({
+            message: {
+              role: "assistant",
+              content: functionResponse,
+              tool_used: functionName,
+            },
+          }),
+          { headers: { "Content-Type": "application/json" } }
+        );
+      }
+
+      // Append tool result for LLM follow-up
       updatedMessages.push({
         role: "tool",
         tool_call_id: toolCall.id,
         name: functionName,
         content: functionResponse,
       });
-      console.log("tool used: " + functionName)
     }
 
-
-    // Final call to let the LLM incorporate the function results
+    // Second LLM call to incorporate tool results
     const secondResponse = await groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
       messages: updatedMessages,
     });
 
-    console.log()
-    console.log("Second LLM Call Response:", secondResponse.choices[0].message.content);
-    console.log()
-
-    const functionObj = { ...secondResponse.choices[0].message, role: "function", tool_used: toolCalls[0].function.name }
-
     return new Response(
-      JSON.stringify({ message: functionObj }),
+      JSON.stringify({
+        message: {
+          ...secondResponse.choices[0].message,
+          role: "function",
+          tool_used: toolCalls[0].function.name,
+        },
+      }),
       { headers: { "Content-Type": "application/json" } }
     );
   } else {
-    console.log()
-    console.log("tools not required here, returning the first LLM response....")
-    console.log()
-
-    // If no tool calls, just return original response
+    // No tool needed
     return new Response(
       JSON.stringify({ message: responseMessage }),
       { headers: { "Content-Type": "application/json" } }
     );
-
   }
-
-
-  // IMP: stream code response code
-  // const stream = new ReadableStream({
-  //   async start(controller) {
-  //     for await (const chunk of response) {
-  //       const content = chunk.choices?.[0]?.delta?.content;
-  //       if (content) {
-  //         controller.enqueue(new TextEncoder().encode(content));
-  //       }
-  //     }
-  //     controller.close();
-  //   },
-  // });
-  // return new StreamingTextResponse(stream);
 }
 
 

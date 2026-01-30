@@ -16,8 +16,9 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = path.join(
   'node_modules/pdfjs-dist/legacy/build/pdf.worker.js'
 );
 
-// export const runtime = 'edge'
-
+// 📁 Store uploaded documents in memory (per session)
+const documentStore = new Map<string, string>();
+const documentFileNameMap = new Map<string, string>(); // Maps fileName -> documentId
 
 export const get_syllabus_from_pdf = async ({ 
   subject, 
@@ -210,6 +211,133 @@ function convertToRoman(num: string): string {
   return romanNumerals[num] || num;
 }
 
+// 📄 Extract text from uploaded PDF
+async function extractTextFromPDF(base64Data: string): Promise<string> {
+  try {
+    const buffer = Buffer.from(base64Data, 'base64');
+    const data = new Uint8Array(buffer);
+    const pdf = await pdfjsLib.getDocument({ data, disableWorker: true }).promise;
+
+    let fullText = '';
+    
+    for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+      const page = await pdf.getPage(pageNum);
+      const content = await page.getTextContent();
+      
+      const items = content.items.sort((a: any, b: any) => {
+        const yDiff = Math.abs(a.transform[5] - b.transform[5]);
+        if (yDiff > 5) return b.transform[5] - a.transform[5];
+        return a.transform[4] - b.transform[4];
+      });
+      
+      let currentY = -1;
+      let lineText = '';
+      let pageText = `\n--- Page ${pageNum} ---\n`;
+      
+      items.forEach((item: any) => {
+        const y = item.transform[5];
+        const text = item.str;
+        
+        if (currentY !== -1 && Math.abs(currentY - y) > 5) {
+          pageText += lineText.trim() + '\n';
+          lineText = '';
+        }
+        
+        lineText += text + ' ';
+        currentY = y;
+      });
+      
+      pageText += lineText.trim();
+      fullText += pageText + '\n';
+    }
+
+    return fullText;
+  } catch (error: any) {
+    throw new Error(`Failed to extract PDF text: ${error.message}`);
+  }
+}
+
+// 📝 Extract text from TXT/MD files
+function extractTextFromPlainText(base64Data: string): string {
+  const buffer = Buffer.from(base64Data, 'base64');
+  return buffer.toString('utf-8');
+}
+
+// 🆕 Upload and store document
+async function upload_document({ 
+  documentId, 
+  fileName, 
+  fileContent, 
+  fileType 
+}: any) {
+  try {
+    console.log(`📤 Uploading document: ${fileName} (${fileType})`);
+    
+    let extractedText = '';
+
+    if (fileType === 'application/pdf') {
+      extractedText = await extractTextFromPDF(fileContent);
+    } else if (fileType === 'text/plain' || fileType === 'text/markdown') {
+      extractedText = extractTextFromPlainText(fileContent);
+    } else {
+      return `❌ **Unsupported file type**: ${fileType}\n\n✅ **Supported formats**: PDF, TXT, MD`;
+    }
+
+    // Store in memory with documentId as key
+    documentStore.set(documentId, extractedText);
+    
+    // ✅ FIX: Also map fileName to documentId for easy lookup
+    documentFileNameMap.set(fileName, documentId);
+
+    console.log(`✅ Stored document ${documentId} with ${extractedText.length} characters`);
+    console.log(`📝 Mapped fileName "${fileName}" -> documentId "${documentId}"`);
+
+    return `✅ **Document uploaded successfully!**\n\n📄 **File**: ${fileName}\n📊 **Characters**: ${extractedText.length}\n\n💬 You can now ask questions about this document!`;
+  } catch (error: any) {
+    console.error('Document upload error:', error);
+    return `⚠️ **Error uploading document:** ${error.message}`;
+  }
+}
+
+// 🆕 Query uploaded document
+async function query_document({ documentId, question }: any) {
+  try {
+    console.log(`❓ Querying document ${documentId}: "${question}"`);
+    
+    // ✅ FIX: Try to find document by ID first, then by fileName
+    let documentContent = documentStore.get(documentId);
+    
+    if (!documentContent) {
+      // Maybe documentId is actually a fileName, try the mapping
+      const actualDocId = documentFileNameMap.get(documentId);
+      if (actualDocId) {
+        console.log(`🔄 Found documentId via fileName mapping: ${documentId} -> ${actualDocId}`);
+        documentContent = documentStore.get(actualDocId);
+      }
+    }
+
+    if (!documentContent) {
+      console.log(`❌ Document not found. Available documents:`, Array.from(documentStore.keys()));
+      console.log(`📋 Available fileName mappings:`, Array.from(documentFileNameMap.entries()));
+      return `❌ **No document found**. Please upload a document first using the upload button.`;
+    }
+
+    // Truncate document if too long (Groq has token limits)
+    const maxChars = 25000; // Adjust based on your model's context window
+    const truncatedContent = documentContent.length > maxChars 
+      ? documentContent.slice(0, maxChars) + '\n\n[... document truncated ...]'
+      : documentContent;
+
+    return {
+      content: truncatedContent,
+      question: question
+    };
+  } catch (error: any) {
+    console.error('Document query error:', error);
+    return `⚠️ **Error querying document:** ${error.message}`;
+  }
+}
+
 export const runtime = 'nodejs';
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY! });
@@ -330,14 +458,58 @@ const tools = [
         required: ["subject", "unit"]
       }
     }
-  }  
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "upload_document",
+      description: "Upload and store a document (PDF, TXT, MD) for later querying.",
+      parameters: {
+        type: "object",
+        properties: {
+          documentId: {
+            type: "string",
+            description: "Unique identifier for the document"
+          },
+          fileName: {
+            type: "string",
+            description: "Name of the uploaded file"
+          },
+          fileContent: {
+            type: "string",
+            description: "Base64 encoded file content"
+          },
+          fileType: {
+            type: "string",
+            description: "MIME type of the file (e.g., 'application/pdf', 'text/plain')"
+          }
+        },
+        required: ["documentId", "fileName", "fileContent", "fileType"]
+      }
+    }
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "query_document",
+      description: "Answer questions about a previously uploaded document. Use the documentId OR fileName from the most recent upload.",
+      parameters: {
+        type: "object",
+        properties: {
+          documentId: {
+            type: "string",
+            description: "The ID or fileName of the uploaded document to query"
+          },
+          question: {
+            type: "string",
+            description: "The question to answer from the document"
+          }
+        },
+        required: ["documentId", "question"]
+      }
+    }
+  }
 ];
-
-
-
-
-
-
 
 const systemMessage = {
   role: "system",
@@ -372,47 +544,29 @@ const systemMessage = {
   - The study tips should include: important points to focus on, example/problem practice advice, and revision strategies.
   - Make the tips concise, actionable, and relevant to the specific syllabus unit.
 
+    📄 Document Upload & Query Feature:
+    - Users can upload documents (PDF, TXT, MD) to ask questions about them.
+    - When a user uploads a document, use the upload_document tool to store it.
+    - When a user asks questions about their uploaded document, use the query_document tool.
+    - ✅ IMPORTANT: When calling query_document, use EITHER the documentId OR the fileName (whichever the user mentions or that was most recently uploaded).
+    - You can answer questions by analyzing the document content returned from query_document.
+    - Be context-aware and provide relevant answers based on the document content.
+    - IMPORTANT: When answering questions about uploaded documents, ONLY use information from the uploaded document content, not from your general knowledge.
+
     Stay concise, but helpful.
 
     Try to strictly generate the response in proper markdown format so that it would render properly on frontend UI.
     you can decide the markdown style/design according to the scenario such as generating table,bold heading,etc.
     Try to make the chat interactive with adding some imojis and icons as you want.
 
-    staff information -
-    Principal
-Name: Dr. Santosh D. Chede
-
-Designation: Principal, DYPCET Kolhapur
-
-Qualification: Ph.D. in Electronics and Communication
-
-Email: principal.dypcet@dypgroup.edu.in
-
-Specialization: Electronics and Telecommunication
-​
-
-college website - coek.dypgroup.edu.in
-
-
-🏛️ Heads of Departments (HODs)
-
-Department	HOD Name
-Chemical Engineering	Prof. (Dr.) K. T. Jadhav
-Computer Science & Engineering	Prof. Radhika Jinendra Dhanal
-Mechanical Engineering	Dr. S. J. Raykar
-Civil Engineering	Dr. Kiran M. Mane
-Electronics & Telecommunication Engineering	Dr. Tanajirao B. Mohite-Patil
-Data Science	Dr. Ganesh V. Patil
-Artificial Intelligence & Machine Learning	Dr. Siddheshwar V. Patil
-Architecture	Prof. I. S. Jadhav
-
+   
 
 🛠️ Available Tools
 
 You have access to the following tools:
 
     get_attendance
-    Use this to fetch a student’s attendance by roll number.
+    Use this to fetch a student's attendance by roll number.
     Required: roll_number (string)
 
     get_timetable
@@ -420,42 +574,71 @@ You have access to the following tools:
     Required: year (int) and branch (string)
     example format: year:{1,2,3,4} branch:{CSE,MECH,CIVIL,AIML} the parameters should be strictly in this format.
 
+    upload_document
+    Use this to store uploaded documents for querying.
+    Required: documentId, fileName, fileContent (base64), fileType
+
+    query_document
+    Use this to answer questions about uploaded documents.
+    Required: documentId (can be the actual ID or the fileName), question
+
 💬 Example User Inputs and Expected Behavior
 
-    User: “What’s my attendance?”
-    You: “Sure! Could you please share your roll number so I can check your attendance?”
+    User: "What's my attendance?"
+    You: "Sure! Could you please share your roll number so I can check your attendance?"
 
-    User: “Can you show me the timetable for Second year Computer Science?”
+    User: "Can you show me the timetable for Second year Computer Science?"
     You: [Call get_timetable with year="2", department="CSE"]
 
+    User: [Uploads a PDF document]
+    You: [Call upload_document with the document details]
+
+    User: "What is the main topic discussed in my uploaded document?"
+    You: [Call query_document with the fileName or documentId, and analyze the content to provide an answer based ONLY on the document content]
+
+
+  🛠️ TOOL CALLING INSTRUCTIONS:
+  - When you need to use a tool, respond ONLY with the tool call
+  - Do NOT add any commentary before or after the tool call
+  - Use proper JSON format for tool arguments
+  - After receiving tool results, then provide your response to the user
+  
 `,
 };
-
-
-
-// also try to respond in proper html format so that the response would render on frontend properly
-// such as if you are responding a time table,you can create a html table UI suitable for a dark Unser Interface.
-// when returning html try to be as creative as possible in generating attractive html UI.
 
 const availableFunctions: Record<string, Function> = {
   get_attendance,
   get_timetable,
   get_syllabus_from_pdf,
-
+  upload_document,
+  query_document,
 };
 
 
 export async function POST(req: Request) {
-  const { messages } = await req.json();
+  const { messages, documentUpload } = await req.json();
+  
+  // Handle document upload separately
+  if (documentUpload) {
+    const { documentId, fileName, fileContent, fileType } = documentUpload;
+    const result = await upload_document({ documentId, fileName, fileContent, fileType });
+    return new Response(
+      JSON.stringify({
+        message: {
+          role: "assistant",
+          content: result,
+        },
+      }),
+      { headers: { "Content-Type": "application/json" } }
+    );
+  }
+
   const userMessage = messages[messages.length - 1].content;
   console.log("\nUser input:", userMessage, "\n");
 
   const updatedMessages = [systemMessage, ...messages];
 
-
-
-
-  // Otherwise, call the main LLM to decide tool usage
+  // Call the main LLM to decide tool usage
   const response = await groq.chat.completions.create({
     model: "llama-3.3-70b-versatile",
     messages: updatedMessages,
@@ -498,12 +681,51 @@ export async function POST(req: Request) {
         );
       }
 
+      // ✅ For document queries, pass content to LLM for analysis
+      if (functionName === "query_document") {
+        if (typeof functionResponse === 'object' && functionResponse.content) {
+          updatedMessages.push({
+            role: "user",
+            content: `Based ONLY on the following document content, please answer this question: "${functionResponse.question}"\n\nDocument Content:\n${functionResponse.content}\n\nIMPORTANT: Only use information from the document content above. Do not use your general knowledge.`,
+          });
+
+          const docQueryResponse = await groq.chat.completions.create({
+            model: "llama-3.3-70b-versatile",
+            messages: updatedMessages,
+            max_tokens: 4096,
+          });
+
+          return new Response(
+            JSON.stringify({
+              message: {
+                role: "assistant",
+                content: docQueryResponse.choices[0].message.content,
+                tool_used: functionName,
+              },
+            }),
+            { headers: { "Content-Type": "application/json" } }
+          );
+        } else {
+          // Error message from query_document
+          return new Response(
+            JSON.stringify({
+              message: {
+                role: "assistant",
+                content: functionResponse,
+                tool_used: functionName,
+              },
+            }),
+            { headers: { "Content-Type": "application/json" } }
+          );
+        }
+      }
+
       // Append tool result for LLM follow-up
       updatedMessages.push({
         role: "tool",
         tool_call_id: toolCall.id,
         name: functionName,
-        content: functionResponse,
+        content: typeof functionResponse === 'string' ? functionResponse : JSON.stringify(functionResponse),
       });
     }
 
@@ -531,5 +753,3 @@ export async function POST(req: Request) {
     );
   }
 }
-
-

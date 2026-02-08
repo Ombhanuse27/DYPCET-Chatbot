@@ -510,13 +510,12 @@ const tools = [
     }
   }
 ];
-
 const systemMessage = {
   role: "system",
-  content: ` You are DYPCET AI Assistant, a helpful, polite, and knowledgeable virtual assistant for Dr. D. Y. Patil College of Engineering & Technology (DYPCET).
+  content: `You are DYPCET AI Assistant, a helpful, polite, and knowledgeable virtual assistant for Dr. D. Y. Patil College of Engineering & Technology (DYPCET).
     Your job is to assist students by providing accurate and relevant information about the college.
     You have access to certain tools to fetch student-specific data such as attendance and class timetable.
-    If the users input has some spelling mistakes,please correct them and analyse the tool use required or not.
+    If the users input has some spelling mistakes, please correct them and analyse the tool use required or not.
 
 🧠 Personality & Behavior Guidelines
 
@@ -538,6 +537,12 @@ const systemMessage = {
 
     ⚠️ Important: When requesting timetable, always convert year to integer (1,2,3,4) and branch to exact database name ("Computer Science", "Mechanical", "Civil", etc.) before calling get_timetable.
 
+    ⚠️ Important Database Mapping:
+- If user says "CSE" or "Computer Science", use branch: "CSE"
+- If user says "Mech" or "Mechanical", use branch: "MECH"
+- If user says "Civil", use branch: "CIVIL"
+- Ensure the branch name is always Uppercase when calling the tool.
+
     Special instruction for syllabus requests:
 
   - When the user requests a unit syllabus, after fetching it from the PDF, generate **custom study tips dynamically** based on the topics extracted.
@@ -550,16 +555,13 @@ const systemMessage = {
     - When a user asks questions about their uploaded document, use the query_document tool.
     - ✅ IMPORTANT: When calling query_document, use EITHER the documentId OR the fileName (whichever the user mentions or that was most recently uploaded).
     - You can answer questions by analyzing the document content returned from query_document.
-    - Be context-aware and provide relevant answers based on the document content.
     - IMPORTANT: When answering questions about uploaded documents, ONLY use information from the uploaded document content, not from your general knowledge.
 
     Stay concise, but helpful.
 
     Try to strictly generate the response in proper markdown format so that it would render properly on frontend UI.
-    you can decide the markdown style/design according to the scenario such as generating table,bold heading,etc.
-    Try to make the chat interactive with adding some imojis and icons as you want.
-
-   
+    You can decide the markdown style/design according to the scenario such as generating table, bold heading, etc.
+    Try to make the chat interactive with adding some emojis and icons as you want.
 
 🛠️ Available Tools
 
@@ -572,7 +574,7 @@ You have access to the following tools:
     get_timetable
     Use this to fetch the class timetable based on the academic year and department.
     Required: year (int) and branch (string)
-    example format: year:{1,2,3,4} branch:{CSE,MECH,CIVIL,AIML} the parameters should be strictly in this format.
+    example format: year:1 branch:CSE 
 
     upload_document
     Use this to store uploaded documents for querying.
@@ -581,28 +583,10 @@ You have access to the following tools:
     query_document
     Use this to answer questions about uploaded documents.
     Required: documentId (can be the actual ID or the fileName), question
-
-💬 Example User Inputs and Expected Behavior
-
-    User: "What's my attendance?"
-    You: "Sure! Could you please share your roll number so I can check your attendance?"
-
-    User: "Can you show me the timetable for Second year Computer Science?"
-    You: [Call get_timetable with year="2", department="CSE"]
-
-    User: [Uploads a PDF document]
-    You: [Call upload_document with the document details]
-
-    User: "What is the main topic discussed in my uploaded document?"
-    You: [Call query_document with the fileName or documentId, and analyze the content to provide an answer based ONLY on the document content]
-
-
-  🛠️ TOOL CALLING INSTRUCTIONS:
-  - When you need to use a tool, respond ONLY with the tool call
-  - Do NOT add any commentary before or after the tool call
-  - Use proper JSON format for tool arguments
-  - After receiving tool results, then provide your response to the user
-  
+    
+    get_syllabus_from_pdf
+    Use this to extract unit-wise syllabus.
+    Required: subject (string), unit (string)
 `,
 };
 
@@ -658,6 +642,7 @@ export async function POST(req: Request) {
 
   // Handle tool calls
   if (toolCalls && toolCalls.length > 0) {
+    updatedMessages.push(responseMessage);
     for (const toolCall of toolCalls) {
       const functionName = toolCall.function.name;
       const func = availableFunctions[functionName];
@@ -667,21 +652,7 @@ export async function POST(req: Request) {
       const functionResponse = await func(functionArgs);
       console.log(`Tool ${functionName} response:`, functionResponse);
 
-      // ✅ For syllabus, return directly without a second LLM call
-      if (functionName === "get_syllabus_from_pdf") {
-        return new Response(
-          JSON.stringify({
-            message: {
-              role: "assistant",
-              content: functionResponse,
-              tool_used: functionName,
-            },
-          }),
-          { headers: { "Content-Type": "application/json" } }
-        );
-      }
-
-      // ✅ For document queries, pass content to LLM for analysis
+      // ✅ 1. DOCUMENT QUERY: Keep existing logic exactly as is
       if (functionName === "query_document") {
         if (typeof functionResponse === 'object' && functionResponse.content) {
           updatedMessages.push({
@@ -706,12 +677,11 @@ export async function POST(req: Request) {
             { headers: { "Content-Type": "application/json" } }
           );
         } else {
-          // Error message from query_document
           return new Response(
             JSON.stringify({
               message: {
                 role: "assistant",
-                content: functionResponse,
+                content: functionResponse, // Error message
                 tool_used: functionName,
               },
             }),
@@ -720,13 +690,27 @@ export async function POST(req: Request) {
         }
       }
 
-      // Append tool result for LLM follow-up
+      // ✅ 2. SYLLABUS & OTHERS: Append result to history (removed early return)
       updatedMessages.push({
         role: "tool",
         tool_call_id: toolCall.id,
         name: functionName,
         content: typeof functionResponse === 'string' ? functionResponse : JSON.stringify(functionResponse),
       });
+
+      // ✅ 3. NEW: Add "Interactive Study Tips" instruction ONLY for syllabus
+      if (functionName === "get_syllabus_from_pdf") {
+        updatedMessages.push({
+          role: "system",
+          content: `The syllabus content is provided above. 
+          Now, present this to the student in a highly engaging Markdown format.
+          1. List the topics clearly with relevant emojis.
+          2. Add a '🧠 Smart Study Strategy' section: Explain which topics might be conceptually hard or high-scoring based on the content.
+          3. Add a '❓ Practice Question' idea based on the topics.
+          4. Add a '🔄 Revision Tip' to help the student remember the content effectively.
+          5. Keep the tone encouraging.`
+        });
+      }
     }
 
     // Second LLM call to incorporate tool results
@@ -739,7 +723,7 @@ export async function POST(req: Request) {
       JSON.stringify({
         message: {
           ...secondResponse.choices[0].message,
-          role: "function",
+          role: "assistant",
           tool_used: toolCalls[0].function.name,
         },
       }),

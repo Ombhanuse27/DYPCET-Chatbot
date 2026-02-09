@@ -15,29 +15,31 @@ export function ChatList({ messages }: ChatList) {
   return (
     <div className="relative mx-auto max-w-2xl px-4">
       {messages.map((message: any, index) => {
-        let parsedMessage: any
-        try {
-          parsedMessage = JSON.parse(message.content)
-          console.log(parsedMessage.message)
-          console.log(parsedMessage.message.tool_used)
-          return (
-            <div key={index}>
-              <ChatMessage message={parsedMessage.message} />
-              {index < messages.length - 1 && (
-                <Separator className="my-4 md:my-8" />
-              )}
-            </div>
-          )
-        } catch (error) {
-          return (
-            <div key={index}>
-              <ChatMessage message={message} />
-              {index < messages.length - 1 && (
-                <Separator className="my-4 md:my-8" />
-              )}
-            </div>
-          )
+        // ✅ FIX: Better message parsing logic
+        let displayMessage = message;
+        
+        // Only try to parse if content looks like JSON
+        if (typeof message.content === 'string' && 
+            message.content.trim().startsWith('{')) {
+          try {
+            const parsed = JSON.parse(message.content);
+            if (parsed.message) {
+              displayMessage = parsed.message;
+            }
+          } catch (error) {
+            // Not JSON, use original message
+            console.log('Message is not JSON, using as-is');
+          }
         }
+
+        return (
+          <div key={message.id || index}>
+            <ChatMessage message={displayMessage} />
+            {index < messages.length - 1 && (
+              <Separator className="my-4 md:my-8" />
+            )}
+          </div>
+        )
       })}
     </div>
   )

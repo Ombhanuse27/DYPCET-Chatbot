@@ -974,6 +974,12 @@ Special instruction for syllabus requests:
   2. Use OCR to convert the PDF to text first
   3. Upload a text-based version
 
+  ⚠️ CRITICAL - Tool Calling Format:
+- When calling tools, use ONLY the exact function names provided: get_attendance, get_timetable, get_syllabus_from_pdf, upload_document, query_document
+- Do NOT add spaces between function name and parameters
+- Format: query_document{"documentId":"...","question":"..."}
+- NOT: query_document {"documentId":"...","question":"..."}
+
 🎯 Handling Document Upload Confirmations:
 - When a user sees a document upload confirmation message, DO NOT treat it as a question.
 - If the message is just the upload confirmation (starting with "# ✅ Document Uploaded Successfully!"), respond briefly and encouragingly like:
@@ -1051,9 +1057,25 @@ export async function POST(req: Request) {
   }
 
   const userMessage = messages[messages.length - 1].content;
-  console.log("\nUser input:", userMessage, "\n");
+console.log("\nUser input:", userMessage, "\n");
 
-  const updatedMessages = [systemMessage, ...messages];
+// ✅ Clean the messages to remove any malformed tool calls
+const cleanedMessages = messages.map((msg: any) => {
+  // Remove tool-related fields from user/assistant messages
+  if (msg.role === 'assistant' && msg.tool_calls) {
+    return {
+      role: msg.role,
+      content: msg.content || null,
+      tool_calls: msg.tool_calls
+    };
+  }
+  return {
+    role: msg.role,
+    content: msg.content
+  };
+});
+
+const updatedMessages = [systemMessage, ...cleanedMessages];
 
   try {
     // Call the main LLM to decide tool usage

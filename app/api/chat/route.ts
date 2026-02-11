@@ -1086,6 +1086,27 @@ export async function POST(req: Request) {
         const functionResponse = await func(functionArgs);
         console.log(`Tool ${functionName} response:`, functionResponse);
 
+        // ✅ Check if this is a first-time request or a reformatting request
+        const isReformatRequest = messages.length > 2 && 
+          (userMessage.toLowerCase().includes('table') || 
+           userMessage.toLowerCase().includes('format') ||
+           userMessage.toLowerCase().includes('different') ||
+           userMessage.toLowerCase().includes('show'));
+
+        // ✅ DIRECT RETURN for attendance and timetable (only for first-time requests)
+        if ((functionName === "get_attendance" || functionName === "get_timetable") && !isReformatRequest) {
+          return new Response(
+            JSON.stringify({
+              message: {
+                role: "assistant",
+                content: functionResponse,
+                tool_used: functionName,
+              },
+            }),
+            { headers: { "Content-Type": "application/json" } }
+          );
+        }
+   
         // ✅ 1. DOCUMENT QUERY: Enhanced with truncation warning
         if (functionName === "query_document") {
           if (typeof functionResponse === 'object' && functionResponse.content) {

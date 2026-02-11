@@ -33,13 +33,13 @@ export function ChatList({ messages }: ChatList) {
         }
 
         return (
-          <div key={message.id || index}>
-            <ChatMessage message={displayMessage} />
-            {index < messages.length - 1 && (
-              <Separator className="my-4 md:my-8" />
-            )}
-          </div>
-        )
+  <div key={message.id ? `msg-${message.id}-${index}` : `msg-${index}`}>
+    <ChatMessage message={displayMessage} />
+    {index < messages.length - 1 && (
+      <Separator className="my-4 md:my-8" />
+    )}
+  </div>
+) 
       })}
     </div>
   )

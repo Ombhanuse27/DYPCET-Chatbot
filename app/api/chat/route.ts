@@ -1,8 +1,18 @@
 import Groq from "groq-sdk";
-import mysql from "mysql2/promise";
+import { Pool } from "pg";
 import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.js';
 import fs from 'fs';
 import path from 'path';
+
+export const runtime = 'nodejs';
+export const maxDuration = 60;
+
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+  max: 1,
+});
 
 // ✅ FIX: This prevents PDF.js from looking for the 'canvas' module in Node.js
 const PDFJS_CONFIG = {
@@ -11,22 +21,22 @@ const PDFJS_CONFIG = {
   disableAutoFetch: true,
 };
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = path.join(
-  process.cwd(), 
-  'node_modules/pdfjs-dist/legacy/build/pdf.worker.js'
-);
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  require.resolve('pdfjs-dist/legacy/build/pdf.worker.js');
+
 // 📁 Store uploaded documents in memory (persisted globally across requests)
-declare global {
-  var documentStore: Map<string, string> | undefined;
-  var documentFileNameMap: Map<string, string> | undefined;
-}
+// declare global {
+//   var documentStore: Map<string, string> | undefined;
+//   var documentFileNameMap: Map<string, string> | undefined;
+// }
 
-const documentStore = global.documentStore ?? new Map<string, string>();
-const documentFileNameMap = global.documentFileNameMap ?? new Map<string, string>();
+// const documentStore = global.documentStore ?? new Map<string, string>();
+// const documentFileNameMap = global.documentFileNameMap ?? new Map<string, string>();
 
-// Persist to global to maintain state across requests
-global.documentStore = documentStore;
-global.documentFileNameMap = documentFileNameMap;
+// // Persist to global to maintain state across requests
+// global.documentStore = documentStore;
+// global.documentFileNameMap = documentFileNameMap;
+
 
 export const get_syllabus_from_pdf = async ({ 
   subject, 
@@ -393,10 +403,16 @@ If you just need to reference this document, you can:
     }
 
     // Store in memory with documentId as key
-    documentStore.set(documentId, extractedText);
-    
-    // ✅ FIX: Also map fileName to documentId for easy lookup
-    documentFileNameMap.set(fileName, documentId);
+    await pool.query(
+  `
+  INSERT INTO documents (id, file_name, content)
+  VALUES ($1, $2, $3)
+  ON CONFLICT (id) DO UPDATE
+  SET content = EXCLUDED.content,
+      file_name = EXCLUDED.file_name
+  `,
+  [documentId, fileName, extractedText]
+);
 
     console.log(`✅ Stored document ${documentId} with ${extractedText.length} characters`);
     console.log(`📝 Mapped fileName "${fileName}" -> documentId "${documentId}"`);
@@ -447,98 +463,38 @@ If the problem persists, please try a different file or contact support.`;
 async function query_document({ documentId, question }: any) {
   try {
     console.log(`❓ Querying document ${documentId}: "${question}"`);
-    
-    // ✅ FIX: Try to find document by ID first, then by fileName
-    let documentContent = documentStore.get(documentId);
-    
-    if (!documentContent) {
-      // Maybe documentId is actually a fileName, try the mapping
-      const actualDocId = documentFileNameMap.get(documentId);
-      if (actualDocId) {
-        console.log(`🔄 Found documentId via fileName mapping: ${documentId} -> ${actualDocId}`);
-        documentContent = documentStore.get(actualDocId);
-      }
+
+    const result = await pool.query(
+      `
+      SELECT content, file_name
+      FROM documents
+      WHERE id = $1 OR file_name = $1
+      `,
+      [documentId]
+    );
+
+    if (result.rows.length === 0) {
+      return `# ❌ Document Not Found
+
+No document found with ID or name: **${documentId}**
+
+Please upload a document first.`;
     }
 
-    if (!documentContent) {
-      console.log(`❌ Document not found. Available documents:`, Array.from(documentStore.keys()));
-      console.log(`📋 Available fileName mappings:`, Array.from(documentFileNameMap.entries()));
-      
-      const availableDocs = Array.from(documentFileNameMap.keys());
-      
-      if (availableDocs.length === 0) {
-        return `# ❌ No Document Found
+    const documentContent = result.rows[0].content;
 
-**You haven't uploaded any documents yet.**
-
-## 📤 How to Upload:
-1. Click the **upload button** in the chat interface
-2. Select a PDF, TXT, or MD file
-3. Wait for the upload confirmation
-4. Then ask your questions!
-
-**I'll be ready to analyze your document once you upload it! 📚**`;
-      } else {
-        return `# ❌ Document Not Found
-
-**The document "${documentId}" could not be found.**
-
-## 📋 Available Documents:
-${availableDocs.map((doc, idx) => `${idx + 1}. **${doc}**`).join('\n')}
-
-**Please specify one of the documents above, or upload a new document.**`;
-      }
-    }
-
-    // ✅ NEW: Check if document content is essentially empty (image-based PDF)
     const meaningfulContent = documentContent.replace(/\s+/g, ' ').trim();
     const wordCount = meaningfulContent.split(/\s+/).filter(word => word.length > 0).length;
-    
-    if (wordCount < 10) {
-      // Get original filename if possible
-      let fileName = documentId;
-      for (const [name, id] of documentFileNameMap.entries()) {
-        if (id === documentId) {
-          fileName = name;
-          break;
-        }
-      }
 
+    if (wordCount < 10) {
       return `# ⚠️ Cannot Answer - Insufficient Content
 
-**Document:** ${fileName}
+This document appears to contain very little extractable text.
 
-This document appears to be **image-based or has minimal extractable text** (only ${wordCount} words found).
-
-## 🔍 The Issue:
-- Your PDF likely contains scanned images or graphics
-- Our system can only read actual text from PDFs
-- Certificates, scanned documents, and forms are often in this format
-
-## ✅ What You Can Do:
-
-### Option 1: Manual Input
-Just **tell me the information** you need help with! For example:
-- *"I have a certificate from [Organization] for [Course Name]"*
-- *"The document shows [specific details]"*
-
-### Option 2: Upload Text Version
-1. **Use OCR** to convert the PDF to text:
-   - Adobe Acrobat: Tools → Recognize Text
-   - Online: ilovepdf.com, pdf2go.com
-2. **Copy the text** into a .txt file
-3. **Re-upload** the text file
-
-### Option 3: Ask Differently
-If you need general help:
-- *"How do I format a certificate?"*
-- *"What should be included in a completion certificate?"*
-
-**I'm here to help - just need the content in a readable format! 📄✨**`;
+Please upload a text-based version or use OCR.`;
     }
 
-    // Truncate document if too long (Groq has token limits)
-    const maxChars = 25000; // Adjust based on your model's context window
+    const maxChars = 25000;
     const isTruncated = documentContent.length > maxChars;
     const truncatedContent = isTruncated
       ? documentContent.slice(0, maxChars) + '\n\n[... document truncated for length ...]'
@@ -546,42 +502,33 @@ If you need general help:
 
     return {
       content: truncatedContent,
-      question: question,
-      isTruncated: isTruncated,
+      question,
+      isTruncated,
       originalLength: documentContent.length
     };
+
   } catch (error: any) {
     console.error('Document query error:', error);
     return `# ⚠️ Query Error
 
-**An error occurred while processing your question.**
-
-## 🔍 Error Details:
-\`${error.message}\`
-
-## 🛠️ What You Can Try:
-- **Rephrase your question** - Try asking in a different way
-- **Be more specific** - Include keywords from the document
-- **Re-upload the document** - If the issue persists
-- **Ask a simpler question** - Break down complex queries
-
-**I'm here to help once the issue is resolved! 💪**`;
+${error.message}`;
   }
 }
 
-export const runtime = 'nodejs';
+
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY! });
 
-const db = mysql.createPool({
-  host: 'localhost',
-  user: 'root',
-  password: 'root',
-  database: 'collegedb',
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0
-});
+// const db = mysql.createPool({
+//   host: 'localhost',
+//   user: 'root',
+//   password: 'root',
+//   database: 'collegedb',
+//   waitForConnections: true,
+//   connectionLimit: 10,
+//   queueLimit: 0
+// });
+
 
 async function get_attendance({ roll_number }: any) {
   console.log("parameters to get attendance is : " + roll_number);
@@ -601,10 +548,12 @@ async function get_attendance({ roll_number }: any) {
 **Enter your roll number to check attendance.**`;
     }
 
-    const [rows]: any = await db.execute(
-      "SELECT attendance_percentage, name FROM students WHERE id = ?", 
-      [roll_number]
-    );
+    const result = await pool.query(
+  "SELECT attendance_percentage, name FROM students WHERE id = $1",
+  [roll_number]
+);
+
+const rows = result.rows;
     
     if (rows.length > 0) {
       const attendance = rows[0].attendance_percentage;
@@ -709,7 +658,8 @@ async function get_timetable({ year, branch }: any) {
     }
 
     // Validate year
-    if (![1, 2, 3, 4].includes(parseInt(year))) {
+    const yearInt = Number(year);
+if (![1,2,3,4].includes(yearInt)){
       return `# ❌ Invalid Year
 
 **Year "${year}" is not valid.**
@@ -723,10 +673,12 @@ async function get_timetable({ year, branch }: any) {
 **Please specify a year between 1 and 4.**`;
     }
 
-    const [rows]: any = await db.execute(
-      "SELECT day, time_slot, subject FROM timetable WHERE year = ? AND branch = ? ORDER BY FIELD(day, 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'), time_slot",
-      [year, branch]
-    );
+    const result = await pool.query(
+  "SELECT day, time_slot, subject FROM timetable WHERE year = $1 AND branch = $2 ORDER BY day, time_slot",
+  [year, branch]
+);
+
+const rows = result.rows;
 
     if (rows.length > 0) {
       // Map year to text
@@ -760,15 +712,18 @@ async function get_timetable({ year, branch }: any) {
       return timetableText;
     } else {
       // Provide helpful feedback when timetable not found
-      const [allBranches]: any = await db.execute(
-        "SELECT DISTINCT branch FROM timetable WHERE year = ?",
-        [year]
-      );
-      
-      const [allYears]: any = await db.execute(
-        "SELECT DISTINCT year FROM timetable WHERE branch = ?",
-        [branch]
-      );
+      const branchesResult = await pool.query(
+  "SELECT DISTINCT branch FROM timetable WHERE year = $1",
+  [year]
+);
+
+const yearsResult = await pool.query(
+  "SELECT DISTINCT year FROM timetable WHERE branch = $1",
+  [branch]
+);
+
+const allBranches = branchesResult.rows;
+const allYears = yearsResult.rows;
 
       let suggestionText = '';
       

@@ -38,13 +38,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc =
 // global.documentFileNameMap = documentFileNameMap;
 
 
-export const get_syllabus_from_pdf = async ({ 
-  subject, 
-  unit 
-}: { 
-  subject: string; 
-  unit: string 
-}) => {
+async function get_syllabus_from_pdf({ subject, unit }: { subject: string; unit: string }) {
   try {
     const syllabusPath = path.join(process.cwd(), 'public/TY-CSE-syllabus.pdf');
     
@@ -53,7 +47,7 @@ export const get_syllabus_from_pdf = async ({
     }
 
     const data = new Uint8Array(fs.readFileSync(syllabusPath));
-    const pdf = await pdfjsLib.getDocument({ data, disableWorker: true }).promise;
+    const pdf = await pdfjsLib.getDocument({ data } as any).promise;
 
     let fullText = '';
     let pageTexts: string[] = [];
@@ -276,7 +270,7 @@ async function extractTextFromPDF(base64Data: string): Promise<string> {
   try {
     const buffer = Buffer.from(base64Data, 'base64');
     const data = new Uint8Array(buffer);
-    const pdf = await pdfjsLib.getDocument({ data, disableWorker: true }).promise;
+    const pdf = await pdfjsLib.getDocument({ data } as any).promise;
 
     let fullText = '';
     
@@ -371,7 +365,10 @@ Try uploading a different file or check the original document.`;
     }
 
     // ✅ NEW: Check if PDF is image-based (very low character count)
-    const wordCount = extractedText.split(/\s+/).filter(word => word.length > 0).length;
+    const wordCount = extractedText
+  .split(/\s+/)
+  .filter((word: string) => word.length > 0)
+  .length;
     const isLikelyImageBased = fileType === 'application/pdf' && wordCount < 10;
 
     if (isLikelyImageBased) {
@@ -484,7 +481,10 @@ Please upload a document first.`;
     const documentContent = result.rows[0].content;
 
     const meaningfulContent = documentContent.replace(/\s+/g, ' ').trim();
-    const wordCount = meaningfulContent.split(/\s+/).filter(word => word.length > 0).length;
+    const wordCount = meaningfulContent
+  .split(/\s+/)
+  .filter((word: string) => word.length > 0)
+  .length;
 
     if (wordCount < 10) {
       return `# ⚠️ Cannot Answer - Insufficient Content

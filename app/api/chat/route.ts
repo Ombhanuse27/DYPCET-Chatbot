@@ -11,7 +11,11 @@ const PDFJS_CONFIG = {
   disableAutoFetch: true,
 };
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = require.resolve('pdfjs-dist/legacy/build/pdf.worker.js');
+// ✅ PRODUCTION FIX: workerSrc must be a plain string so PDF.js's internal
+// `.endsWith()` check doesn't throw. The value is never actually fetched
+// because disableWorker:true is passed to every getDocument() call, which
+// bypasses the worker entirely. This works on localhost and Vercel alike.
+pdfjsLib.GlobalWorkerOptions.workerSrc = 'pdf.worker.js';
 // 📁 Store uploaded documents in memory (persisted globally across requests)
 declare global {
   var documentStore: Map<string, string> | undefined;

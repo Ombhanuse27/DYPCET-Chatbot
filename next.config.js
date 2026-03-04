@@ -4,9 +4,6 @@ module.exports = {
   experimental: {
     serverActions: {}, // previously: serverActions: true,
   },
-  outputFileTracingIncludes: {
-  '/api/chat': ['./node_modules/pdfjs-dist/legacy/build/pdf.worker.js'],
-},
   images: {
     remotePatterns: [
       {
@@ -17,7 +14,6 @@ module.exports = {
       },
     ],
   },
-
   eslint: {
     ignoreDuringBuilds: true,
   },

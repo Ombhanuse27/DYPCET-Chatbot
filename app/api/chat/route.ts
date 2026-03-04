@@ -11,10 +11,7 @@ const PDFJS_CONFIG = {
   disableAutoFetch: true,
 };
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = path.join(
-  process.cwd(), 
-  'node_modules/pdfjs-dist/legacy/build/pdf.worker.js'
-);
+pdfjsLib.GlobalWorkerOptions.workerSrc = '';
 // 📁 Store uploaded documents in memory (persisted globally across requests)
 declare global {
   var documentStore: Map<string, string> | undefined;

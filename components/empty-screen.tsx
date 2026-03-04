@@ -15,7 +15,7 @@ const exampleMessages = [
   },
   {
     heading: 'ask for your timetable',
-    message: `Give me the time table for 1st year CSE branch: \n`
+    message: `Give me the time table for 3rd year CSE branch: \n`
   },
   {
     heading: 'ask for your syllabus',

@@ -1,427 +1,990 @@
 import Groq from "groq-sdk";
-import { Pool, PoolClient } from "pg";
-import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.js";
-import fs from "fs";
-import path from "path";
+import { Pool } from "pg";
+import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.js';
+import fs from 'fs';
+import path from 'path';
 
-export const runtime = "nodejs";
-export const maxDuration = 60;
-
-// FIX 1: Singleton pool — max:1 caused bottlenecks under load
-declare global {
-  var __pgPool: Pool | undefined;
-}
-
-function getPool(): Pool {
-  if (global.__pgPool) return global.__pgPool;
-  const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    // FIX 2: Only add SSL for non-local connections
-    ssl: process.env.DATABASE_URL?.includes("localhost")
-      ? undefined
-      : { rejectUnauthorized: false },
-    // FIX 3: Raise cap for concurrent serverless invocations
-    max: 10,
-    idleTimeoutMillis: 30_000,
-    connectionTimeoutMillis: 5_000,
-    // FIX 4: Per-query statement timeout — prevents hung queries
-    statement_timeout: 15_000,
-  });
-  // FIX 5: Handle idle errors so process never crashes
-  pool.on("error", (err) => {
-    console.error("[pg-pool] idle client error:", err.message);
-  });
-  global.__pgPool = pool;
-  return pool;
-}
-
-// FIX 6: PDF.js worker — require.resolve() breaks under webpack/Next.js
-// production bundling. Use a static string or env-provided path instead.
-if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
-  pdfjsLib.GlobalWorkerOptions.workerSrc =
-    process.env.PDFJS_WORKER_SRC ?? "pdfjs-dist/legacy/build/pdf.worker.js";
-}
-
-// FIX 7: Logger — suppress debug/PII logs in production
-const IS_PROD = process.env.NODE_ENV === "production";
-const logger = {
-  log: (...args: unknown[]) => { if (!IS_PROD) console.log(...args); },
-  error: (...args: unknown[]) => console.error(...args),
+// ✅ FIX: This prevents PDF.js from looking for the 'canvas' module in Node.js
+const PDFJS_CONFIG = {
+  disableRange: true,
+  disableStream: true,
+  disableAutoFetch: true,
 };
 
-// FIX 8: Safe JSON-parse — bad LLM tool-call arguments won't throw
-function safeJsonParse<T = unknown>(str: string): T | null {
-  try { return JSON.parse(str) as T; }
-  catch { return null; }
+pdfjsLib.GlobalWorkerOptions.workerSrc = path.join(
+  process.cwd(), 
+  'node_modules/pdfjs-dist/legacy/build/pdf.worker.js'
+);
+// 📁 Store uploaded documents in memory (persisted globally across requests)
+declare global {
+  var documentStore: Map<string, string> | undefined;
+  var documentFileNameMap: Map<string, string> | undefined;
 }
 
-// Helper: explicit client checkout so release() is guaranteed
-async function dbQuery<T extends Record<string, unknown>>(
-  sql: string,
-  params: unknown[] = []
-): Promise<T[]> {
-  const pool = getPool();
-  let client: PoolClient | undefined;
+const documentStore = global.documentStore ?? new Map<string, string>();
+const documentFileNameMap = global.documentFileNameMap ?? new Map<string, string>();
+
+// Persist to global to maintain state across requests
+global.documentStore = documentStore;
+global.documentFileNameMap = documentFileNameMap;
+
+const get_syllabus_from_pdf = async ({ 
+  subject, 
+  unit 
+}: { 
+  subject: string; 
+  unit: string 
+}) => {
   try {
-    client = await pool.connect();
-    const result = await client.query<T>(sql, params);
-    return result.rows;
-  } finally {
-    client?.release();
-  }
-}
-
-function convertToRoman(num: string): string {
-  const map: Record<string, string> = {
-    "1": "I", "2": "II", "3": "III", "4": "IV",
-    "5": "V", "6": "VI", "7": "VII", "8": "VIII",
-  };
-  return map[num] ?? num;
-}
-
-// FIX 9: Replaced fs.readFileSync with async fs.promises.readFile
-async function get_syllabus_from_pdf({ subject, unit }: { subject: string; unit: string }) {
-  try {
-    const syllabusPath = path.join(process.cwd(), "public/TY-CSE-syllabus.pdf");
-    try {
-      await fs.promises.access(syllabusPath, fs.constants.R_OK);
-    } catch {
+    const syllabusPath = path.join(process.cwd(), 'public/TY-CSE-syllabus.pdf');
+    
+    if (!fs.existsSync(syllabusPath)) {
       throw new Error(`Syllabus file not found at ${syllabusPath}`);
     }
 
-    const raw = await fs.promises.readFile(syllabusPath);
-    const data = new Uint8Array(raw);
-    const pdf = await pdfjsLib.getDocument({ data } as never).promise;
+    const data = new Uint8Array(fs.readFileSync(syllabusPath));
+    const pdf = await pdfjsLib.getDocument({ data, disableWorker: true } as any).promise;
 
-    let fullText = "";
-    const pageTexts: string[] = [];
-
+    let fullText = '';
+    let pageTexts: string[] = [];
+    
+    // Extract text with better formatting preservation
     for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
       const page = await pdf.getPage(pageNum);
       const content = await page.getTextContent();
-      const items = (content.items as Array<{ transform: number[]; str: string }>).sort(
-        (a, b) => {
-          const yDiff = Math.abs(a.transform[5] - b.transform[5]);
-          if (yDiff > 5) return b.transform[5] - a.transform[5];
-          return a.transform[4] - b.transform[4];
-        }
-      );
-      let currentY = -1, lineText = "", pageText = "";
-      for (const item of items) {
-        const y = item.transform[5], text = item.str;
+      
+      // Sort items by vertical position to maintain reading order
+      const items = content.items.sort((a: any, b: any) => {
+        const yDiff = Math.abs(a.transform[5] - b.transform[5]);
+        if (yDiff > 5) return b.transform[5] - a.transform[5]; // Top to bottom
+        return a.transform[4] - b.transform[4]; // Left to right
+      });
+      
+      let currentY = -1;
+      let lineText = '';
+      let pageText = '';
+      
+      items.forEach((item: any) => {
+        const y = item.transform[5];
+        const text = item.str;
+        
+        // New line detection
         if (currentY !== -1 && Math.abs(currentY - y) > 5) {
-          pageText += lineText.trim() + "\n";
-          lineText = "";
+          pageText += lineText.trim() + '\n';
+          lineText = '';
         }
-        lineText += text + " ";
+        
+        lineText += text + ' ';
         currentY = y;
-      }
+      });
+      
       pageText += lineText.trim();
       pageTexts.push(pageText);
-      fullText += pageText + "\n\n";
+      fullText += pageText + '\n\n';
     }
 
-    logger.log(`Searching for: "${subject}" - Unit ${unit}`);
+    console.log(`🔍 Searching for: "${subject}" - Unit ${unit}`);
 
-    const normalize = (s: string) =>
-      s.toLowerCase().replace(/[^\w\s]/g, "").replace(/\s+/g, " ").trim();
-    const normalizedSubject = normalize(subject);
+    // Normalize subject name for better matching
+    const normalizeSubject = (str: string) => {
+      return str.toLowerCase()
+        .replace(/[^\w\s]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    };
 
+    const normalizedSearchSubject = normalizeSubject(subject);
+    
+    // Try multiple subject matching patterns
     const subjectPatterns = [
-      new RegExp(`Course\\s+Title\\s*:?\\s*${subject}`, "i"),
-      new RegExp(`${subject}`, "i"),
-      new RegExp(subject.split(" ").join("\\s+"), "i"),
+      new RegExp(`Course\\s+Title\\s*:?\\s*${subject}`, 'i'),
+      new RegExp(`${subject}`, 'i'),
+      new RegExp(subject.split(' ').join('\\s+'), 'i'),
     ];
+
     let subjectStartIndex = -1;
-    for (const p of subjectPatterns) {
-      const m = fullText.match(p);
-      if (m && m.index !== undefined) { subjectStartIndex = m.index; break; }
+    let matchedPattern = null;
+
+    // Find the subject in the text
+    for (const pattern of subjectPatterns) {
+      const match = fullText.match(pattern);
+      if (match) {
+        subjectStartIndex = match.index!;
+        matchedPattern = pattern;
+        break;
+      }
     }
+
     if (subjectStartIndex === -1) {
-      for (const line of fullText.split("\n")) {
-        if (normalize(line).includes(normalizedSubject)) {
-          subjectStartIndex = fullText.indexOf(line);
+      // Try fuzzy matching on each line
+      const lines = fullText.split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        if (normalizeSubject(lines[i]).includes(normalizedSearchSubject)) {
+          subjectStartIndex = fullText.indexOf(lines[i]);
           break;
         }
       }
     }
+
     if (subjectStartIndex === -1) {
-      return `# ❌ Subject Not Found\n\n**"${subject}"** could not be located in the syllabus database.\n\n## 💡 Suggestions:\n- **Check the spelling** of the subject name\n- Try using the **full subject name** (e.g., "Compiler Design" instead of "CD")\n- Verify this subject is part of your curriculum\n\n📝 **Tip:** You can ask "What subjects are available?" to see the complete list.`;
+      return `# ❌ Subject Not Found
+
+**"${subject}"** could not be located in the syllabus database.
+
+## 💡 Suggestions:
+- **Check the spelling** of the subject name
+- Try using the **full subject name** (e.g., "Compiler Design" instead of "CD")
+- Verify this subject is part of your curriculum
+- Common subjects include: Computer Networks, Operating Systems, Database Management, etc.
+
+📝 **Tip:** You can ask "What subjects are available?" to see the complete list.`;
     }
 
+    // Extract content after subject match
     const afterSubject = fullText.slice(subjectStartIndex);
+    
+    // Find the next subject/course to limit our search
     const nextCourseMatch = afterSubject.slice(100).match(/Course\s+Title\s*:?/i);
-    const searchableText = nextCourseMatch
-      ? afterSubject.slice(0, 100 + (nextCourseMatch.index ?? 0))
+    const searchableText = nextCourseMatch 
+      ? afterSubject.slice(0, 100 + nextCourseMatch.index!)
       : afterSubject.slice(0, 5000);
 
+    // Multiple unit matching patterns
     const unitPatterns = [
-      new RegExp(`Unit[\\s-]*${unit}\\s*:([\\s\\S]+?)(?=Unit[\\s-]*(?:\\d+|[IVX]+)\\s*:|Course\\s+Outcomes|Text\\s+Books?|References?|$)`, "i"),
-      new RegExp(`UNIT[\\s-]*${unit}([\\s\\S]+?)(?=UNIT[\\s-]*(?:\\d+|[IVX]+)|Course\\s+Outcomes|Text\\s+Books?|References?|$)`, "i"),
-      new RegExp(`Unit[\\s-]*${convertToRoman(unit)}\\s*:?([\\s\\S]+?)(?=Unit[\\s-]*(?:\\d+|[IVX]+)|Course\\s+Outcomes|Text\\s+Books?|References?|$)`, "i"),
+      // Pattern 1: "Unit 1:" or "Unit I:"
+      new RegExp(
+        `Unit[\\s-]*${unit}\\s*:([\\s\\S]+?)(?=Unit[\\s-]*(?:\\d+|[IVX]+)\\s*:|Course\\s+Outcomes|Text\\s+Books?|References?|$)`,
+        'i'
+      ),
+      // Pattern 2: "UNIT 1" or "UNIT-1"
+      new RegExp(
+        `UNIT[\\s-]*${unit}([\\s\\S]+?)(?=UNIT[\\s-]*(?:\\d+|[IVX]+)|Course\\s+Outcomes|Text\\s+Books?|References?|$)`,
+        'i'
+      ),
+      // Pattern 3: Roman numerals (I, II, III, IV, V, VI)
+      new RegExp(
+        `Unit[\\s-]*${convertToRoman(unit)}\\s*:?([\\s\\S]+?)(?=Unit[\\s-]*(?:\\d+|[IVX]+)|Course\\s+Outcomes|Text\\s+Books?|References?|$)`,
+        'i'
+      ),
     ];
-    let unitContent: string | null = null;
-    for (const p of unitPatterns) {
-      const m = searchableText.match(p);
-      if (m?.[1]) { unitContent = m[1]; break; }
+
+    let unitContent = null;
+    let matchedUnitPattern = null;
+
+    for (const pattern of unitPatterns) {
+      const match = searchableText.match(pattern);
+      if (match && match[1]) {
+        unitContent = match[1];
+        matchedUnitPattern = pattern;
+        break;
+      }
     }
 
     if (!unitContent) {
-      return `# ❌ Unit Not Found\n\n**Unit ${unit}** could not be found for **${subject}**.\n\n## 💡 Common Reasons:\n- This unit may not exist for this subject\n- Most subjects have **Units 1-6**\n\n### ✅ What You Can Do:\n1. **Verify the unit number** (try 1, 2, 3, 4, 5, or 6)\n2. **Ask for another unit** from the same subject\n\n📚 Example: *"Show me Unit 1 of ${subject}"*`;
+      return `# ❌ Unit Not Found
+
+**Unit ${unit}** could not be found for **${subject}**.
+
+## 💡 Common Reasons:
+- This unit may not exist for this subject
+- Most subjects have **Units 1-6**
+- The syllabus structure might be different
+
+### ✅ What You Can Do:
+1. **Verify the unit number** (try 1, 2, 3, 4, 5, or 6)
+2. **Ask for another unit** from the same subject
+3. **Check your course curriculum** for the correct unit structure
+
+📚 Example: *"Show me Unit 1 of ${subject}"*`;
     }
 
-    let cleanedContent = unitContent.trim()
-      .replace(/\s+/g, " ")
-      .replace(/(\d+)\s+Hours?/gi, "**$1 Hours**")
-      .replace(/^\s*[:;-]\s*/gm, "")
-      .slice(0, 2000);
+    // Clean and format the content
+    let cleanedContent = unitContent
+      .trim()
+      .replace(/\s+/g, ' ') // Normalize whitespace
+      .replace(/(\d+)\s+Hours?/gi, '**$1 Hours**') // Bold hours
+      .replace(/^\s*[:;-]\s*/gm, '') // Remove leading punctuation
+      .slice(0, 2000); // Limit length
 
-    const lines = cleanedContent.split(/[,;]/).filter((l) => l.trim().length > 5);
-    let formattedContent = "";
+    // Try to extract topics/subtopics
+    const lines = cleanedContent.split(/[,;]/).filter(l => l.trim().length > 5);
+    
+    let formattedContent = '';
     if (lines.length > 1) {
-      formattedContent = "## 📚 Topics Covered:\n\n";
+      formattedContent = '## 📚 Topics Covered:\n\n';
       lines.forEach((line, idx) => {
-        const t = line.trim();
-        if (t) formattedContent += `${idx + 1}. ${t}\n`;
+        const trimmedLine = line.trim();
+        if (trimmedLine) {
+          formattedContent += `${idx + 1}. ${trimmedLine}\n`;
+        }
       });
     } else {
       formattedContent = `## 📚 Content:\n\n${cleanedContent}`;
     }
 
+    // Extract hours if present
     const hoursMatch = unitContent.match(/(\d+)\s*Hours?/i);
-    const hours = hoursMatch ? `\n\n⏱️ **Duration:** ${hoursMatch[1]} Hours` : "";
+    const hours = hoursMatch ? `\n\n⏱️ **Duration:** ${hoursMatch[1]} Hours` : '';
 
-    return `# 📘 ${subject}\n## 🎯 Unit ${unit}\n\n${formattedContent}${hours}\n\n---\n*💡 The AI will now provide you with smart study tips and strategies for this unit!*`;
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    logger.error("PDF parsing error:", message);
-    return `# ⚠️ Error Processing Syllabus\n\n**Something went wrong while extracting the syllabus.**\n\n## 🔍 Error Details:\n\`${message}\`\n\n## 🛠️ Troubleshooting:\n- Ensure the syllabus PDF file exists in the correct location\n- Check if the PDF is properly formatted and not corrupted\n- Try requesting a different subject or unit`;
+    return `# 📘 ${subject}
+## 🎯 Unit ${unit}
+
+${formattedContent}${hours}
+
+---
+*💡 The AI will now provide you with smart study tips and strategies for this unit!*`;
+    
+  } catch (err: any) {
+    console.error('PDF parsing error:', err);
+    return `# ⚠️ Error Processing Syllabus
+
+**Something went wrong while extracting the syllabus.**
+
+## 🔍 Error Details:
+\`${err.message}\`
+
+## 🛠️ Troubleshooting:
+- Ensure the syllabus PDF file exists in the correct location
+- Check if the PDF is properly formatted and not corrupted
+- Try requesting a different subject or unit
+
+If the problem persists, please contact technical support.`;
   }
+};
+
+// Helper function to convert numbers to Roman numerals
+function convertToRoman(num: string): string {
+  const romanNumerals: { [key: string]: string } = {
+    '1': 'I', '2': 'II', '3': 'III', '4': 'IV',
+    '5': 'V', '6': 'VI', '7': 'VII', '8': 'VIII'
+  };
+  return romanNumerals[num] || num;
 }
 
+// 📄 Extract text from uploaded PDF
 async function extractTextFromPDF(base64Data: string): Promise<string> {
   try {
-    const buffer = Buffer.from(base64Data, "base64");
+    const buffer = Buffer.from(base64Data, 'base64');
     const data = new Uint8Array(buffer);
-    const pdf = await pdfjsLib.getDocument({ data } as never).promise;
-    let fullText = "";
+    const pdf = await pdfjsLib.getDocument({ data, disableWorker: true } as any).promise;
+
+    let fullText = '';
+    
     for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
       const page = await pdf.getPage(pageNum);
       const content = await page.getTextContent();
-      const items = (content.items as Array<{ transform: number[]; str: string }>).sort(
-        (a, b) => {
-          const yDiff = Math.abs(a.transform[5] - b.transform[5]);
-          if (yDiff > 5) return b.transform[5] - a.transform[5];
-          return a.transform[4] - b.transform[4];
-        }
-      );
-      let currentY = -1, lineText = "", pageText = `\n--- Page ${pageNum} ---\n`;
-      for (const item of items) {
-        const y = item.transform[5], text = item.str;
+      
+      const items = content.items.sort((a: any, b: any) => {
+        const yDiff = Math.abs(a.transform[5] - b.transform[5]);
+        if (yDiff > 5) return b.transform[5] - a.transform[5];
+        return a.transform[4] - b.transform[4];
+      });
+      
+      let currentY = -1;
+      let lineText = '';
+      let pageText = `\n--- Page ${pageNum} ---\n`;
+      
+      items.forEach((item: any) => {
+        const y = item.transform[5];
+        const text = item.str;
+        
         if (currentY !== -1 && Math.abs(currentY - y) > 5) {
-          pageText += lineText.trim() + "\n";
-          lineText = "";
+          pageText += lineText.trim() + '\n';
+          lineText = '';
         }
-        lineText += text + " ";
+        
+        lineText += text + ' ';
         currentY = y;
-      }
+      });
+      
       pageText += lineText.trim();
-      fullText += pageText + "\n";
+      fullText += pageText + '\n';
     }
+
     return fullText;
-  } catch (error: unknown) {
-    throw new Error(`Failed to extract PDF text: ${error instanceof Error ? error.message : String(error)}`);
+  } catch (error: any) {
+    throw new Error(`Failed to extract PDF text: ${error.message}`);
   }
 }
 
+// 📝 Extract text from TXT/MD files
 function extractTextFromPlainText(base64Data: string): string {
-  return Buffer.from(base64Data, "base64").toString("utf-8");
+  const buffer = Buffer.from(base64Data, 'base64');
+  return buffer.toString('utf-8');
 }
 
-// FIX 12: Validate upload size before processing
-const MAX_UPLOAD_BYTES = 5 * 1024 * 1024; // 5 MB
-
-async function upload_document({ documentId, fileName, fileContent, fileType }: {
-  documentId: string; fileName: string; fileContent: string; fileType: string;
-}) {
+// 🆕 Upload and store document
+async function upload_document({ 
+  documentId, 
+  fileName, 
+  fileContent, 
+  fileType 
+}: any) {
   try {
-    logger.log(`Uploading document: ${fileName} (${fileType})`);
+    console.log(`📤 Uploading document: ${fileName} (${fileType})`);
+    
+    let extractedText = '';
 
-    // FIX 13: Reject oversized uploads early
-    const estimatedBytes = Math.ceil((fileContent.length * 3) / 4);
-    if (estimatedBytes > MAX_UPLOAD_BYTES) {
-      return `# ❌ File Too Large\n\n**File:** ${fileName}\n\nMaximum allowed size is **5 MB**. Your file is approximately **${(estimatedBytes / 1024 / 1024).toFixed(1)} MB**.\n\n## ✅ Solutions:\n1. **Split the document** into smaller sections\n2. **Compress or reduce** the file size\n3. **Upload only the relevant pages** of the document`;
-    }
-
-    let extractedText = "";
-    if (fileType === "application/pdf") {
+    if (fileType === 'application/pdf') {
       extractedText = await extractTextFromPDF(fileContent);
-    } else if (fileType === "text/plain" || fileType === "text/markdown") {
+    } else if (fileType === 'text/plain' || fileType === 'text/markdown') {
       extractedText = extractTextFromPlainText(fileContent);
     } else {
-      return `# ❌ Unsupported File Type\n\n**File Type:** \`${fileType}\`\n\n## ✅ Supported Formats:\n| Format | Extension | Description |\n|--------|-----------|-------------|\n| 📄 PDF | .pdf | Portable Document Format |\n| 📝 Text | .txt | Plain text files |\n| 📋 Markdown | .md | Markdown documents |\n\n**Please upload a file in one of the supported formats above.**`;
+      return `# ❌ Unsupported File Type
+
+**File Type:** \`${fileType}\`
+
+## ✅ Supported Formats:
+| Format | Extension | Description |
+|--------|-----------|-------------|
+| 📄 PDF | .pdf | Portable Document Format |
+| 📝 Text | .txt | Plain text files |
+| 📋 Markdown | .md | Markdown documents |
+
+**Please upload a file in one of the supported formats above.**`;
     }
 
+    // Validate extracted content
     if (!extractedText || extractedText.trim().length === 0) {
-      return `# ⚠️ Empty Document\n\n**File:** ${fileName}\n\nThe document appears to be empty or couldn't be read properly.\n\n## 🔍 Please check:\n- The file is not corrupted\n- The file actually contains text content\n- The file is not password-protected (for PDFs)\n\nTry uploading a different file or check the original document.`;
+      return `# ⚠️ Empty Document
+
+**File:** ${fileName}
+
+The document appears to be empty or couldn't be read properly.
+
+## 🔍 Please check:
+- The file is not corrupted
+- The file actually contains text content
+- The file is not password-protected (for PDFs)
+
+Try uploading a different file or check the original document.`;
     }
 
-    const wordCount = extractedText.split(/\s+/).filter((w: string) => w.length > 0).length;
-    const isLikelyImageBased = fileType === "application/pdf" && wordCount < 10;
+    // ✅ NEW: Check if PDF is image-based (very low character count)
+    const wordCount = extractedText.split(/\s+/).filter(word => word.length > 0).length;
+    const isLikelyImageBased = fileType === 'application/pdf' && wordCount < 10;
 
     if (isLikelyImageBased) {
-      return `# ⚠️ Image-Based PDF Detected\n\n**File:** ${fileName}\n\nThis appears to be a **scanned or image-based PDF** (only ${wordCount} words extracted).\n\n## 🔍 Why This Happened:\n- The PDF contains images of text rather than actual text\n- Certificates, scanned documents, and some forms are often image-based\n\n## ✅ Solutions:\n1. **Use an OCR tool** to convert the PDF to text first:\n   - Adobe Acrobat (Tools → Enhance Scans → Recognize Text)\n   - Online tools: pdf2go.com, ilovepdf.com\n2. **Copy-paste the text** into a .txt file and upload that instead\n\n**Sorry for the inconvenience! This limitation is due to the document format, not an error.** 📄`;
+      return `# ⚠️ Image-Based PDF Detected
+
+**File:** ${fileName}
+
+This appears to be a **scanned or image-based PDF** (only ${wordCount} words extracted).
+
+## 🔍 Why This Happened:
+- The PDF contains images of text rather than actual text
+- Certificates, scanned documents, and some forms are often image-based
+- Our system can only extract text from text-based PDFs
+
+## ✅ Solutions:
+1. **Use an OCR tool** to convert the PDF to text first:
+   - Adobe Acrobat (Tools → Enhance Scans → Recognize Text)
+   - Online tools: pdf2go.com, ilovepdf.com
+   - Desktop: Tesseract OCR
+2. **Copy-paste the text** into a .txt file and upload that instead
+3. **Re-export the PDF** from the original source with text enabled
+
+## 💡 Alternative:
+If you just need to reference this document, you can:
+- Ask me questions and **manually type the relevant information**
+- Upload a **text version** of the content
+
+**Sorry for the inconvenience! This limitation is due to the document format, not an error.** 📄`;
     }
 
-    await dbQuery(
-      `INSERT INTO documents (id, file_name, content) VALUES ($1, $2, $3)
-       ON CONFLICT (id) DO UPDATE SET content = EXCLUDED.content, file_name = EXCLUDED.file_name`,
+    // ✅ PRODUCTION CHANGE: Persist document to PostgreSQL instead of in-memory Map
+    await pool.query(
+      `
+      INSERT INTO documents (id, file_name, content)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (id) DO UPDATE
+      SET content = EXCLUDED.content,
+          file_name = EXCLUDED.file_name
+      `,
       [documentId, fileName, extractedText]
     );
 
-    logger.log(`Stored document ${documentId} with ${extractedText.length} characters`);
+    // Keep in-memory maps in sync for backward compatibility
+    documentStore.set(documentId, extractedText);
+    documentFileNameMap.set(fileName, documentId);
 
-    const lineCount = extractedText.split("\n").length;
-    return `# ✅ Document Uploaded Successfully!\n\n## 📄 File Details:\n| Property | Value |\n|----------|-------|\n| **📁 File Name** | ${fileName} |\n| **📊 Characters** | ${extractedText.length.toLocaleString()} |\n| **📝 Words** | ${wordCount.toLocaleString()} |\n| **📄 Lines** | ${lineCount.toLocaleString()} |\n| **🆔 Document ID** | \`${documentId}\` |\n\n---\n\n## 💬 What's Next?\nYou can now ask me questions about this document! For example:\n- *"Summarize this document"*\n- *"What are the key points in this document?"*\n- *"Find information about [topic] in the document"*\n\n**I'm ready to help you explore the content! 🚀**`;
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
-    logger.error("Document upload error:", message);
-    return `# ⚠️ Upload Error\n\n**An error occurred while uploading your document.**\n\n## 🔍 Error Details:\n\`${message}\`\n\n## 🛠️ Troubleshooting Steps:\n1. **Check file size** - Very large files may cause issues\n2. **Verify file format** - Ensure it's PDF, TXT, or MD\n3. **Try re-uploading** - Sometimes a retry fixes the issue\n\nIf the problem persists, please try a different file or contact support.`;
+    console.log(`✅ Stored document ${documentId} with ${extractedText.length} characters`);
+    console.log(`📝 Mapped fileName "${fileName}" -> documentId "${documentId}"`);
+
+    // Calculate document stats
+    const lineCount = extractedText.split('\n').length;
+
+    return `# ✅ Document Uploaded Successfully!
+
+## 📄 File Details:
+| Property | Value |
+|----------|-------|
+| **📁 File Name** | ${fileName} |
+| **📊 Characters** | ${extractedText.length.toLocaleString()} |
+| **📝 Words** | ${wordCount.toLocaleString()} |
+| **📄 Lines** | ${lineCount.toLocaleString()} |
+| **🆔 Document ID** | \`${documentId}\` |
+
+---
+
+## 💬 What's Next?
+You can now ask me questions about this document! For example:
+- *"Summarize this document"*
+- *"What are the key points in this document?"*
+- *"Find information about [topic] in the document"*
+
+**I'm ready to help you explore the content! 🚀**`;
+  } catch (error: any) {
+    console.error('Document upload error:', error);
+    return `# ⚠️ Upload Error
+
+**An error occurred while uploading your document.**
+
+## 🔍 Error Details:
+\`${error.message}\`
+
+## 🛠️ Troubleshooting Steps:
+1. **Check file size** - Very large files may cause issues
+2. **Verify file format** - Ensure it's PDF, TXT, or MD
+3. **Try re-uploading** - Sometimes a retry fixes the issue
+4. **Check file integrity** - Make sure the file isn't corrupted
+
+If the problem persists, please try a different file or contact support.`;
   }
 }
 
-async function query_document({ documentId, question }: { documentId: string; question: string }) {
+// 🆕 Query uploaded document
+async function query_document({ documentId, question }: any) {
   try {
-    logger.log(`Querying document ${documentId}`);
-    const rows = await dbQuery<{ content: string; file_name: string }>(
-      `SELECT content, file_name FROM documents WHERE id = $1 OR file_name = $1`,
+    console.log(`❓ Querying document ${documentId}: "${question}"`);
+    
+    // ✅ PRODUCTION CHANGE: Query PostgreSQL first, fall back to in-memory store
+    let documentContent: string | undefined;
+    let resolvedFileName: string | undefined;
+
+    const dbResult = await pool.query(
+      `
+      SELECT content, file_name
+      FROM documents
+      WHERE id = $1 OR file_name = $1
+      `,
       [documentId]
     );
-    if (rows.length === 0) {
-      return `# ❌ Document Not Found\n\nNo document found with ID or name: **${documentId}**\n\nPlease upload a document first.`;
+
+    if (dbResult.rows.length > 0) {
+      documentContent = dbResult.rows[0].content;
+      resolvedFileName = dbResult.rows[0].file_name;
     }
-    const documentContent = rows[0].content;
-    const wordCount = documentContent.replace(/\s+/g, " ").trim().split(/\s+/).filter((w: string) => w.length > 0).length;
+
+    // Fall back to in-memory store if not found in DB (e.g. during same-request lifecycle)
+    if (!documentContent) {
+      documentContent = documentStore.get(documentId);
+      if (!documentContent) {
+        const actualDocId = documentFileNameMap.get(documentId);
+        if (actualDocId) {
+          console.log(`🔄 Found documentId via fileName mapping: ${documentId} -> ${actualDocId}`);
+          documentContent = documentStore.get(actualDocId);
+        }
+      }
+    }
+
+    if (!documentContent) {
+      console.log(`❌ Document not found. Available documents:`, Array.from(documentStore.keys()));
+      console.log(`📋 Available fileName mappings:`, Array.from(documentFileNameMap.entries()));
+      
+      const availableDocs = Array.from(documentFileNameMap.keys());
+      
+      if (availableDocs.length === 0) {
+        return `# ❌ No Document Found
+
+**You haven't uploaded any documents yet.**
+
+## 📤 How to Upload:
+1. Click the **upload button** in the chat interface
+2. Select a PDF, TXT, or MD file
+3. Wait for the upload confirmation
+4. Then ask your questions!
+
+**I'll be ready to analyze your document once you upload it! 📚**`;
+      } else {
+        return `# ❌ Document Not Found
+
+**The document "${documentId}" could not be found.**
+
+## 📋 Available Documents:
+${availableDocs.map((doc, idx) => `${idx + 1}. **${doc}**`).join('\n')}
+
+**Please specify one of the documents above, or upload a new document.**`;
+      }
+    }
+
+    // ✅ NEW: Check if document content is essentially empty (image-based PDF)
+    const meaningfulContent = documentContent.replace(/\s+/g, ' ').trim();
+    const wordCount = meaningfulContent.split(/\s+/).filter(word => word.length > 0).length;
+    
     if (wordCount < 10) {
-      return `# ⚠️ Cannot Answer - Insufficient Content\n\nThis document appears to contain very little extractable text.\n\nPlease upload a text-based version or use OCR.`;
+      // Get original filename if possible
+      let fileName = resolvedFileName || documentId;
+      if (!resolvedFileName) {
+        for (const [name, id] of documentFileNameMap.entries()) {
+          if (id === documentId) {
+            fileName = name;
+            break;
+          }
+        }
+      }
+
+      return `# ⚠️ Cannot Answer - Insufficient Content
+
+**Document:** ${fileName}
+
+This document appears to be **image-based or has minimal extractable text** (only ${wordCount} words found).
+
+## 🔍 The Issue:
+- Your PDF likely contains scanned images or graphics
+- Our system can only read actual text from PDFs
+- Certificates, scanned documents, and forms are often in this format
+
+## ✅ What You Can Do:
+
+### Option 1: Manual Input
+Just **tell me the information** you need help with! For example:
+- *"I have a certificate from [Organization] for [Course Name]"*
+- *"The document shows [specific details]"*
+
+### Option 2: Upload Text Version
+1. **Use OCR** to convert the PDF to text:
+   - Adobe Acrobat: Tools → Recognize Text
+   - Online: ilovepdf.com, pdf2go.com
+2. **Copy the text** into a .txt file
+3. **Re-upload** the text file
+
+### Option 3: Ask Differently
+If you need general help:
+- *"How do I format a certificate?"*
+- *"What should be included in a completion certificate?"*
+
+**I'm here to help - just need the content in a readable format! 📄✨**`;
     }
-    const maxChars = 25_000;
+
+    // Truncate document if too long (Groq has token limits)
+    const maxChars = 25000; // Adjust based on your model's context window
     const isTruncated = documentContent.length > maxChars;
     const truncatedContent = isTruncated
-      ? documentContent.slice(0, maxChars) + "\n\n[... document truncated for length ...]"
+      ? documentContent.slice(0, maxChars) + '\n\n[... document truncated for length ...]'
       : documentContent;
-    return { content: truncatedContent, question, isTruncated, originalLength: documentContent.length };
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
-    logger.error("Document query error:", message);
-    return `# ⚠️ Query Error\n\n${message}`;
+
+    return {
+      content: truncatedContent,
+      question: question,
+      isTruncated: isTruncated,
+      originalLength: documentContent.length
+    };
+  } catch (error: any) {
+    console.error('Document query error:', error);
+    return `# ⚠️ Query Error
+
+**An error occurred while processing your question.**
+
+## 🔍 Error Details:
+\`${error.message}\`
+
+## 🛠️ What You Can Try:
+- **Rephrase your question** - Try asking in a different way
+- **Be more specific** - Include keywords from the document
+- **Re-upload the document** - If the issue persists
+- **Ask a simpler question** - Break down complex queries
+
+**I'm here to help once the issue is resolved! 💪**`;
   }
 }
 
-async function get_attendance({ roll_number }: { roll_number: string }) {
-  logger.log("get_attendance called");
+export const runtime = 'nodejs';
+export const maxDuration = 60;
+
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY! });
+
+// ✅ PRODUCTION CHANGE: PostgreSQL pool using DATABASE_URL with SSL
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+  max: 1,
+});
+
+async function get_attendance({ roll_number }: any) {
+  console.log("parameters to get attendance is : " + roll_number);
+  
   try {
-    if (!roll_number || roll_number.toString().trim() === "") {
-      return `# ❌ Invalid Roll Number\n\n**Please provide a valid roll number.**\n\n## 📝 Format Examples:\n- \`2021001\`\n- \`21CSE001\`\n- \`CS001\`\n\n**Enter your roll number to check attendance.**`;
+    // Validate roll number format
+    if (!roll_number || roll_number.toString().trim() === '') {
+      return `# ❌ Invalid Roll Number
+
+**Please provide a valid roll number.**
+
+## 📝 Format Examples:
+- \`2021001\`
+- \`21CSE001\`
+- \`CS001\`
+
+**Enter your roll number to check attendance.**`;
     }
-    const rows = await dbQuery<{ attendance_percentage: number; name: string }>(
+
+    // ✅ PRODUCTION CHANGE: PostgreSQL query with $1 placeholder
+    const result = await pool.query(
       "SELECT attendance_percentage, name FROM students WHERE id = $1",
       [roll_number]
     );
+
+    const rows = result.rows;
+    
     if (rows.length > 0) {
       const attendance = rows[0].attendance_percentage;
-      const studentName = rows[0].name || "Student";
-      let status = "", emoji = "", message = "";
+      const studentName = rows[0].name || 'Student';
+      
+      // Determine attendance status
+      let status = '';
+      let emoji = '';
+      let message = '';
+      
       if (attendance >= 75) {
-        status = "✅ Excellent"; emoji = "🎉"; message = "Keep up the great work!";
+        status = '✅ Excellent';
+        emoji = '🎉';
+        message = 'Keep up the great work!';
       } else if (attendance >= 65) {
-        status = "⚠️ Warning"; emoji = "⚠️"; message = "You need to improve your attendance to meet the 75% requirement.";
+        status = '⚠️ Warning';
+        emoji = '⚠️';
+        message = 'You need to improve your attendance to meet the 75% requirement.';
       } else {
-        status = "❌ Critical"; emoji = "🚨"; message = "Your attendance is critically low! Immediate improvement required.";
+        status = '❌ Critical';
+        emoji = '🚨';
+        message = 'Your attendance is critically low! Immediate improvement required.';
       }
-      let improvementTip = "";
+      
+      // Calculate classes needed to reach 75% (if below)
+      let improvementTip = '';
       if (attendance < 75) {
-        const classesNeeded = Math.ceil(((75 - attendance) / (100 - 75)) * 10);
+        const classesNeeded = Math.ceil((75 - attendance) / (100 - 75) * 10);
         improvementTip = `\n\n## 💡 Improvement Plan:\n**Attend the next ${classesNeeded}+ classes continuously** to improve your percentage.`;
       }
-      return `# 📊 Attendance Report\n\n**Student:** ${studentName}  \n**Roll Number:** ${roll_number}\n\n---\n\n## ${emoji} Current Attendance\n\n| Metric | Value |\n|--------|-------|\n| **Percentage** | **${attendance}%** |\n| **Status** | ${status} |\n| **Required** | 75% (minimum) |\n\n${message}${improvementTip}\n\n---\n*📅 Keep attending classes regularly to maintain good academic standing!*`;
+      
+      return `# 📊 Attendance Report
+
+**Student:** ${studentName}  
+**Roll Number:** ${roll_number}
+
+---
+
+## ${emoji} Current Attendance
+
+| Metric | Value |
+|--------|-------|
+| **Percentage** | **${attendance}%** |
+| **Status** | ${status} |
+| **Required** | 75% (minimum) |
+
+${message}${improvementTip}
+
+---
+*📅 Keep attending classes regularly to maintain good academic standing!*`;
     } else {
-      return `# ❌ Roll Number Not Found\n\n**Roll Number:** \`${roll_number}\`\n\n## 🔍 This could mean:\n- The roll number was entered incorrectly\n- You're not registered in the system yet\n\n## ✅ What to do:\n1. **Double-check your roll number**\n2. **Contact the administration** if the issue persists\n\n**Please verify and try again with the correct roll number.**`;
+      return `# ❌ Roll Number Not Found
+
+**Roll Number:** \`${roll_number}\`
+
+## 🔍 This could mean:
+- The roll number was entered incorrectly
+- You're not registered in the system yet
+- There's a typo in the roll number
+
+## ✅ What to do:
+1. **Double-check your roll number**
+2. **Verify the format** (e.g., 2021001, 21CSE001)
+3. **Contact the administration** if the issue persists
+
+**Please verify and try again with the correct roll number.**`;
     }
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
-    logger.error("Error fetching attendance:", message);
-    return `# ⚠️ Database Error\n\n**Unable to retrieve attendance at this moment.**\n\n## 🔧 Technical Details:\n\`${message}\`\n\n## 💡 Please Try:\n- **Wait a moment** and try again\n- **Contact support** if the issue persists`;
+  } catch (error: any) {
+    console.error("Error fetching attendance:", error);
+    return `# ⚠️ Database Error
+
+**Unable to retrieve attendance at this moment.**
+
+## 🔧 Technical Details:
+\`${error.message}\`
+
+## 💡 Please Try:
+- **Wait a moment** and try again
+- **Check your internet connection**
+- **Contact support** if the issue persists
+
+**We apologize for the inconvenience. Please try again later.**`;
   }
 }
 
-async function get_timetable({ year, branch }: { year: string | number; branch: string }) {
-  logger.log("get_timetable called:", year, branch);
+// Function to fetch timetable by year and department
+async function get_timetable({ year, branch }: any) {
+  console.log("parameters to get timetable are : " + year + "  " + branch);
+  
   try {
+    // Validate inputs
     if (!year || !branch) {
-      return `# ❌ Missing Information\n\n**Please provide both year and branch to fetch the timetable.**\n\n## 📝 Required Information:\n- **Year:** 1, 2, 3, or 4\n- **Branch:** CSE, MECH, CIVIL, etc.`;
+      return `# ❌ Missing Information
+
+**Please provide both year and branch to fetch the timetable.**
+
+## 📝 Required Information:
+- **Year:** 1, 2, 3, or 4
+- **Branch:** CSE, MECH, CIVIL, etc.
+
+**Example:** *"Show me timetable for 3rd year CSE"*`;
     }
+
+    // ✅ PRODUCTION CHANGE: Explicit integer coercion (pg sends numbers as strings)
     const yearInt = Number(year);
     if (![1, 2, 3, 4].includes(yearInt)) {
-      return `# ❌ Invalid Year\n\n**Year "${year}" is not valid.**\n\n## ✅ Valid Years:\n- **1** - First Year\n- **2** - Second Year\n- **3** - Third Year\n- **4** - Fourth Year`;
+      return `# ❌ Invalid Year
+
+**Year "${year}" is not valid.**
+
+## ✅ Valid Years:
+- **1** - First Year
+- **2** - Second Year
+- **3** - Third Year
+- **4** - Fourth Year
+
+**Please specify a year between 1 and 4.**`;
     }
-    const rows = await dbQuery<{ day: string; time_slot: string; subject: string }>(
-      "SELECT day, time_slot, subject FROM timetable WHERE year = $1 AND branch = $2 ORDER BY day, time_slot",
+
+    // ✅ PRODUCTION CHANGE: PostgreSQL query with $1/$2 placeholders.
+    // NOTE: MySQL's ORDER BY FIELD() is replaced with a CASE expression for
+    // deterministic day ordering in PostgreSQL.
+    const result = await pool.query(
+      `SELECT day, time_slot, subject
+       FROM timetable
+       WHERE year = $1 AND branch = $2
+       ORDER BY
+         CASE day
+           WHEN 'Monday'    THEN 1
+           WHEN 'Tuesday'   THEN 2
+           WHEN 'Wednesday' THEN 3
+           WHEN 'Thursday'  THEN 4
+           WHEN 'Friday'    THEN 5
+           WHEN 'Saturday'  THEN 6
+           ELSE 7
+         END,
+         time_slot`,
       [yearInt, branch]
     );
+
+    const rows = result.rows;
+
     if (rows.length > 0) {
-      const yearText = ["First", "Second", "Third", "Fourth"][yearInt - 1];
-      let timetableText = `# 📅 Class Timetable\n\n**Year:** ${yearText} Year  \n**Branch:** ${branch}\n\n---\n\n`;
-      let currentDay = "", dayCount = 0;
-      for (const { day, time_slot, subject } of rows) {
+      // Map year to text
+      const yearText = ['First', 'Second', 'Third', 'Fourth'][yearInt - 1];
+      
+      let timetableText = `# 📅 Class Timetable
+
+**Year:** ${yearText} Year  
+**Branch:** ${branch}
+
+---
+
+`;
+      let currentDay = "";
+      let dayCount = 0;
+
+      rows.forEach(({ day, time_slot, subject }: any) => {
         if (day !== currentDay) {
-          if (currentDay !== "") timetableText += "\n";
+          if (currentDay !== "") {
+            timetableText += '\n';
+          }
           timetableText += `## 📆 ${day}\n\n`;
           currentDay = day;
           dayCount++;
         }
         timetableText += `- ⏰ **${time_slot}** → ${subject}\n`;
-      }
+      });
+
       timetableText += `\n---\n*📚 Total ${dayCount} days of classes scheduled*\n\n💡 **Tip:** Save this timetable or take a screenshot for quick reference!`;
+
       return timetableText;
     } else {
-      const allBranches = await dbQuery<{ branch: string }>("SELECT DISTINCT branch FROM timetable WHERE year = $1", [yearInt]);
-      const allYears = await dbQuery<{ year: number }>("SELECT DISTINCT year FROM timetable WHERE branch = $1", [branch]);
-      let suggestionText = "";
-      if (allBranches.length > 0) suggestionText += `\n\n## 📋 Available Branches for Year ${year}:\n${allBranches.map(r => r.branch).join(", ")}`;
-      if (allYears.length > 0) suggestionText += `\n\n## 📋 Available Years for ${branch}:\n${allYears.map(r => r.year).join(", ")}`;
-      return `# ❌ Timetable Not Found\n\n**No timetable found for:**\n- **Year:** ${year}\n- **Branch:** ${branch}${suggestionText}\n\n## ✅ What You Can Do:\n1. **Verify your year and branch**\n2. **Contact administration** if your timetable should exist`;
+      // ✅ PRODUCTION CHANGE: PostgreSQL queries with $1 placeholder for suggestions
+      const branchesResult = await pool.query(
+        "SELECT DISTINCT branch FROM timetable WHERE year = $1",
+        [yearInt]
+      );
+
+      const yearsResult = await pool.query(
+        "SELECT DISTINCT year FROM timetable WHERE branch = $1",
+        [branch]
+      );
+
+      const allBranches = branchesResult.rows;
+      const allYears = yearsResult.rows;
+
+      let suggestionText = '';
+      
+      if (allBranches.length > 0) {
+        const branches = allBranches.map((r: any) => r.branch).join(', ');
+        suggestionText += `\n\n## 📋 Available Branches for Year ${year}:\n${branches}`;
+      }
+      
+      if (allYears.length > 0) {
+        const years = allYears.map((r: any) => r.year).join(', ');
+        suggestionText += `\n\n## 📋 Available Years for ${branch}:\n${years}`;
+      }
+
+      return `# ❌ Timetable Not Found
+
+**No timetable found for:**
+- **Year:** ${year}
+- **Branch:** ${branch}
+
+## 🔍 Possible Reasons:
+- This combination doesn't exist in the database
+- The timetable hasn't been uploaded yet
+- There might be a spelling error in the branch name
+${suggestionText}
+
+## ✅ What You Can Do:
+1. **Verify your year and branch**
+2. **Check the available options** above
+3. **Contact administration** if your timetable should exist
+
+**Please try again with the correct information.**`;
     }
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
-    logger.error("Error fetching timetable:", message);
-    return `# ⚠️ Database Error\n\n**Unable to retrieve timetable at this moment.**\n\n## 🔧 Technical Details:\n\`${message}\``;
+  } catch (error: any) {
+    console.error("Error fetching timetable:", error);
+    return `# ⚠️ Database Error
+
+**Unable to retrieve timetable at this moment.**
+
+## 🔧 Technical Details:
+\`${error.message}\`
+
+## 💡 Please Try:
+- **Wait a moment** and try again
+- **Check your parameters** (year and branch)
+- **Contact support** if the issue persists
+
+**We apologize for the inconvenience. Please try again later.**`;
   }
 }
 
-// FIX 14: Singleton Groq client with timeout + auto-retry
-declare global {
-  var __groqClient: Groq | undefined;
-}
-function getGroq(): Groq {
-  if (global.__groqClient) return global.__groqClient;
-  global.__groqClient = new Groq({
-    apiKey: process.env.GROQ_API_KEY!,
-    timeout: 55_000,
-    maxRetries: 2,
-  });
-  return global.__groqClient;
-}
-
-const tools: Groq.Chat.Completions.ChatCompletionTool[] = [
-  { type: "function", function: { name: "get_attendance", description: "Fetch student attendance based on roll number.", parameters: { type: "object", properties: { roll_number: { type: "string", description: "The student's roll number." } }, required: ["roll_number"] } } },
-  { type: "function", function: { name: "get_timetable", description: "Fetch the class timetable based on year and branch.", parameters: { type: "object", properties: { year: { type: "integer", description: "The academic year (1-4)." }, branch: { type: "string", description: "The branch name (CSE, MECH, CIVIL, etc.)." } }, required: ["year", "branch"] } } },
-  { type: "function", function: { name: "get_syllabus_from_pdf", description: "Extract unit-wise syllabus from a given subject in the syllabus PDF.", parameters: { type: "object", properties: { subject: { type: "string", description: "The subject name, e.g., 'Compiler Design'" }, unit: { type: "string", description: "The unit number, e.g., '1', '2', etc." } }, required: ["subject", "unit"] } } },
-  { type: "function", function: { name: "upload_document", description: "Upload and store a document (PDF, TXT, MD) for later querying.", parameters: { type: "object", properties: { documentId: { type: "string", description: "Unique identifier for the document" }, fileName: { type: "string", description: "Name of the uploaded file" }, fileContent: { type: "string", description: "Base64 encoded file content" }, fileType: { type: "string", description: "MIME type of the file" } }, required: ["documentId", "fileName", "fileContent", "fileType"] } } },
-  { type: "function", function: { name: "query_document", description: "Answer questions about a previously uploaded document. Use the documentId OR fileName from the most recent upload.", parameters: { type: "object", properties: { documentId: { type: "string", description: "The ID or fileName of the uploaded document to query" }, question: { type: "string", description: "The question to answer from the document" } }, required: ["documentId", "question"] } } },
+const tools = [
+  {
+    type: "function" as const,
+    function: {
+      name: "get_attendance",
+      description: "Fetch student attendance based on roll number.",
+      parameters: {
+        type: "object",
+        properties: {
+          roll_number: {
+            type: "string",
+            description: "The student's roll number."
+          }
+        },
+        required: ["roll_number"]
+      }
+    }
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "get_timetable",
+      description: "Fetch the class timetable based on year and branch.",
+      parameters: {
+        type: "object",
+        properties: {
+          year: {
+            type: "integer",
+            description: "The academic year (e.g., 1,2,3)."
+          },
+          branch: {
+            type: "string",
+            description: "The branch name (e.g., CSE,MECH,CIVIL)."
+          }
+        },
+        required: ["year", "branch"]
+      }
+    }
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "get_syllabus_from_pdf",
+      description: "Extract unit-wise syllabus from a given subject in the syllabus PDF.",
+      parameters: {
+        type: "object",
+        properties: {
+          subject: {
+            type: "string",
+            description: "The subject name, e.g., 'Compiler Design'"
+          },
+          unit: {
+            type: "string",
+            description: "The unit number, e.g., '1', '2', etc."
+          }
+        },
+        required: ["subject", "unit"]
+      }
+    }
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "upload_document",
+      description: "Upload and store a document (PDF, TXT, MD) for later querying.",
+      parameters: {
+        type: "object",
+        properties: {
+          documentId: {
+            type: "string",
+            description: "Unique identifier for the document"
+          },
+          fileName: {
+            type: "string",
+            description: "Name of the uploaded file"
+          },
+          fileContent: {
+            type: "string",
+            description: "Base64 encoded file content"
+          },
+          fileType: {
+            type: "string",
+            description: "MIME type of the file (e.g., 'application/pdf', 'text/plain')"
+          }
+        },
+        required: ["documentId", "fileName", "fileContent", "fileType"]
+      }
+    }
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "query_document",
+      description: "Answer questions about a previously uploaded document. Use the documentId OR fileName from the most recent upload.",
+      parameters: {
+        type: "object",
+        properties: {
+          documentId: {
+            type: "string",
+            description: "The ID or fileName of the uploaded document to query"
+          },
+          question: {
+            type: "string",
+            description: "The question to answer from the document"
+          }
+        },
+        required: ["documentId", "question"]
+      }
+    }
+  }
 ];
 
-const systemMessage: Groq.Chat.Completions.ChatCompletionSystemMessageParam = {
+const systemMessage = {
   role: "system",
   content: `You are DYPCET AI Assistant, a helpful, polite, and knowledgeable virtual assistant for Dr. D. Y. Patil College of Engineering & Technology (DYPCET).
 Your job is to assist students by providing accurate and relevant information about the college.
@@ -459,101 +1022,120 @@ Special instruction for syllabus requests:
 - You can answer questions by analyzing the document content returned from query_document.
 - CRITICAL: When answering questions about uploaded documents, ONLY use information from the uploaded document content, not from your general knowledge. If the information is not in the document, explicitly state that.
 - If a document was truncated due to length, inform the user and suggest they ask more specific questions.
-- ⚠️ IMAGE-BASED PDFs: If a user uploads a certificate, scanned document, or image-based PDF that has minimal text, the upload will fail with a helpful error message. DO NOT call query_document on such documents.
+- ⚠️ IMAGE-BASED PDFs: If a user uploads a certificate, scanned document, or image-based PDF that has minimal text, the upload will fail with a helpful error message. DO NOT call query_document on such documents. Instead, ask the user to either:
+  1. Provide the information manually (you can help based on what they tell you)
+  2. Use OCR to convert the PDF to text first
+  3. Upload a text-based version
 
-⚠️ CRITICAL - Tool Calling Format:
+  ⚠️ CRITICAL - Tool Calling Format:
 - When calling tools, use ONLY the exact function names provided: get_attendance, get_timetable, get_syllabus_from_pdf, upload_document, query_document
+- Do NOT add spaces between function name and parameters
+- Format: query_document{"documentId":"...","question":"..."}
+- NOT: query_document {"documentId":"...","question":"..."}
 
 🎯 Handling Document Upload Confirmations:
 - When a user sees a document upload confirmation message, DO NOT treat it as a question.
-- Respond briefly: "Great! Your document is ready. What would you like to know about it?"
+- If the message is just the upload confirmation (starting with "# ✅ Document Uploaded Successfully!"), respond briefly and encouragingly like:
+  - "Great! Your document is ready. What would you like to know about it?"
+  - "Perfect! The document is loaded. Feel free to ask any questions!"
+  - "Document uploaded! I'm ready to help - just ask your question."
 - NEVER instruct them on how to format queries with documentId - they can just ask naturally.
+- If they ask a vague question like "whose doc is this" or "what is this about", use query_document with their uploaded documentId.
 
-Stay concise, but helpful. Generate responses in proper markdown format for frontend UI rendering.`,
+Stay concise, but helpful.
+
+Try to strictly generate the response in proper markdown format so that it would render properly on frontend UI.
+You can decide the markdown style/design according to the scenario such as generating table, bold heading, etc.
+Try to make the chat interactive with adding some emojis and icons as you want.
+
+🛠️ Available Tools
+
+You have access to the following tools:
+
+1. **get_attendance**
+   - Fetch student attendance by roll number
+   - Required: roll_number (string)
+   - Returns: Formatted attendance report with status and improvement tips
+
+2. **get_timetable**
+   - Fetch class timetable based on year and branch
+   - Required: year (integer: 1,2,3,4) and branch (string: CSE, MECH, CIVIL, etc.)
+   - Example format: year:1 branch:CSE
+   - Returns: Formatted weekly timetable
+
+3. **get_syllabus_from_pdf**
+   - Extract unit-wise syllabus from PDF
+   - Required: subject (string), unit (string)
+   - Returns: Formatted syllabus content with topics
+   - After displaying syllabus, provide smart study strategies
+
+4. **upload_document**
+   - Store uploaded documents for querying
+   - Required: documentId, fileName, fileContent (base64), fileType
+   - Returns: Upload confirmation with document statistics
+   - NOTE: Will return error for image-based PDFs with instructions
+
+5. **query_document**
+   - Answer questions about uploaded documents
+   - Required: documentId (can be actual ID or fileName), question
+   - Returns: Answer based ONLY on document content, or error if document is image-based
+   - IMPORTANT: Never mix general knowledge with document content
+`,
 };
 
-type AnyFn = (args: Record<string, unknown>) => Promise<unknown>;
-const availableFunctions: Record<string, AnyFn> = {
-  get_attendance: get_attendance as AnyFn,
-  get_timetable: get_timetable as AnyFn,
-  get_syllabus_from_pdf: get_syllabus_from_pdf as AnyFn,
-  upload_document: upload_document as AnyFn,
-  query_document: query_document as AnyFn,
+const availableFunctions: Record<string, Function> = {
+  get_attendance,
+  get_timetable,
+  get_syllabus_from_pdf,
+  upload_document,
+  query_document,
 };
-
-// FIX 15: Null-safe rate-limit error formatter
-function handleRateLimitError(error: unknown): string {
-  const raw = error as { error?: { error?: { message?: string } }; message?: string };
-  const errorMessage = raw?.error?.error?.message ?? raw?.message ?? (error instanceof Error ? error.message : "") ?? "";
-  const timeMatch = errorMessage.match(/try again in (.+?)\./i);
-  const waitTime = timeMatch?.[1] ?? "5-10 minutes";
-  return `# ⏳ Rate Limit Reached\n\n**Our AI service has reached its usage limit for today.**\n\n## ⏰ Wait Time:\nPlease try again in **${waitTime}**\n\n## 💡 What You Can Do Right Now:\n\n### Option 1: Wait & Retry ⏱️\n- Come back in **${waitTime}**\n- All your data is saved\n\n### Option 2: Contact Support 📞\n- **Contact college IT support**\n- Mention the rate limit issue\n\n---\n\n## 📊 Technical Details:\n\`\`\`\n${errorMessage}\n\`\`\`\n\n**We apologize for the inconvenience! This is a temporary limit that will reset automatically.** 🙏`;
-}
-
-function errorResponse(content: string, status = 500) {
-  return new Response(
-    JSON.stringify({ message: { role: "assistant", content } }),
-    { status, headers: { "Content-Type": "application/json" } }
-  );
-}
 
 export async function POST(req: Request) {
-  // FIX 16: Content-Type validation
-  const contentType = req.headers.get("content-type") ?? "";
-  if (!contentType.includes("application/json")) {
-    return errorResponse("Invalid Content-Type. Expected application/json.", 415);
-  }
-
-  // FIX 17: Safe JSON parse
-  let body: {
-    messages?: Array<{ role: string; content: string }>;
-    documentUpload?: { documentId: string; fileName: string; fileContent: string; fileType: string };
-  };
-  try {
-    body = await req.json();
-  } catch {
-    return errorResponse("Invalid JSON body.", 400);
-  }
-
-  const { messages, documentUpload } = body;
-
+  const { messages, documentUpload } = await req.json();
+  
+  // Handle document upload separately
   if (documentUpload) {
     const { documentId, fileName, fileContent, fileType } = documentUpload;
-    // FIX 18: Validate required fields
-    if (!documentId || !fileName || !fileContent || !fileType) {
-      return errorResponse("Missing required fields in documentUpload.", 400);
-    }
     const result = await upload_document({ documentId, fileName, fileContent, fileType });
     return new Response(
-      JSON.stringify({ message: { role: "assistant", content: result } }),
+      JSON.stringify({
+        message: {
+          role: "assistant",
+          content: result,
+        },
+      }),
       { headers: { "Content-Type": "application/json" } }
     );
   }
 
-  // FIX 19: Validate messages
-  if (!Array.isArray(messages) || messages.length === 0) {
-    return errorResponse("messages must be a non-empty array.", 400);
+  const userMessage = messages[messages.length - 1].content;
+console.log("\nUser input:", userMessage, "\n");
+
+// ✅ Clean the messages to remove any malformed tool calls
+const cleanedMessages = messages.map((msg: any) => {
+  // Remove tool-related fields from user/assistant messages
+  if (msg.role === 'assistant' && msg.tool_calls) {
+    return {
+      role: msg.role,
+      content: msg.content || null,
+      tool_calls: msg.tool_calls
+    };
   }
+  return {
+    role: msg.role,
+    content: msg.content
+  };
+});
 
-  const userMessage = messages[messages.length - 1]?.content ?? "";
-  logger.log("User input (truncated):", userMessage.slice(0, 120));
-
-  // FIX 20: Build fresh message array per request (prevent cross-request mutation)
-  const cleanedMessages = messages.map(
-    (msg): Groq.Chat.Completions.ChatCompletionMessageParam => {
-      if (msg.role === "assistant") return { role: "assistant", content: msg.content ?? null };
-      return { role: msg.role as "user" | "system", content: msg.content };
-    }
-  );
-
-  const updatedMessages: Groq.Chat.Completions.ChatCompletionMessageParam[] = [systemMessage, ...cleanedMessages];
-  const groq = getGroq();
+const updatedMessages = [systemMessage, ...cleanedMessages];
 
   try {
+    // Call the main LLM to decide tool usage
     const response = await groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
       messages: updatedMessages,
-      tools,
+      tools: tools,
       tool_choice: "auto",
       max_tokens: 4096,
     });
@@ -561,104 +1143,285 @@ export async function POST(req: Request) {
     const responseMessage = response.choices[0].message;
     const toolCalls = responseMessage.tool_calls;
 
-    if (responseMessage.content) logger.log("LLM response (no tool):", responseMessage.content.slice(0, 120));
-    else logger.log("LLM decided to use tools.");
+    if (responseMessage.content != undefined) {
+      console.log("First LLM Call Response:", responseMessage.content);
+    } else {
+      console.log("LLM decided to use tools.");
+    }
 
+    // Handle tool calls
     if (toolCalls && toolCalls.length > 0) {
       updatedMessages.push(responseMessage);
-
       for (const toolCall of toolCalls) {
         const functionName = toolCall.function.name;
         const func = availableFunctions[functionName];
         if (!func) continue;
 
-        // FIX 21: Safe arg parse — bad LLM JSON won't throw
-        const functionArgs = safeJsonParse<Record<string, unknown>>(toolCall.function.arguments) ?? {};
+        const functionArgs = JSON.parse(toolCall.function.arguments);
         const functionResponse = await func(functionArgs);
-        logger.log(`Tool ${functionName} returned (truncated):`, String(functionResponse).slice(0, 200));
+        console.log(`Tool ${functionName} response:`, functionResponse);
 
-        const isReformatRequest = messages.length > 2 &&
-          (userMessage.toLowerCase().includes("table") ||
-           userMessage.toLowerCase().includes("format") ||
-           userMessage.toLowerCase().includes("different") ||
-           userMessage.toLowerCase().includes("show"));
+        // ✅ Check if this is a first-time request or a reformatting request
+        const isReformatRequest = messages.length > 2 && 
+          (userMessage.toLowerCase().includes('table') || 
+           userMessage.toLowerCase().includes('format') ||
+           userMessage.toLowerCase().includes('different') ||
+           userMessage.toLowerCase().includes('show'));
 
+        // ✅ DIRECT RETURN for attendance and timetable (only for first-time requests)
         if ((functionName === "get_attendance" || functionName === "get_timetable") && !isReformatRequest) {
           return new Response(
-            JSON.stringify({ message: { role: "assistant", content: functionResponse, tool_used: functionName } }),
+            JSON.stringify({
+              message: {
+                role: "assistant",
+                content: functionResponse,
+                tool_used: functionName,
+              },
+            }),
             { headers: { "Content-Type": "application/json" } }
           );
         }
-
+   
+        // ✅ 1. DOCUMENT QUERY: Enhanced with truncation warning
         if (functionName === "query_document") {
-          if (typeof functionResponse === "object" && functionResponse !== null && "content" in functionResponse) {
-            const fr = functionResponse as { content: string; question: string; isTruncated: boolean; originalLength: number };
-            let contextMessage = `Based ONLY on the following document content, please answer this question: "${fr.question}"\n\nDocument Content:\n${fr.content}\n\nIMPORTANT: Only use information from the document content above. Do not use your general knowledge.`;
-            if (fr.isTruncated) contextMessage += `\n\n⚠️ NOTE: This document was truncated from ${fr.originalLength.toLocaleString()} to 25,000 characters. If the answer is not found, inform the user and suggest they ask more specific questions.`;
-            updatedMessages.push({ role: "user", content: contextMessage });
+          if (typeof functionResponse === 'object' && functionResponse.content) {
+            let contextMessage = `Based ONLY on the following document content, please answer this question: "${functionResponse.question}"\n\nDocument Content:\n${functionResponse.content}\n\nIMPORTANT: Only use information from the document content above. Do not use your general knowledge.`;
+            
+            // Add truncation warning if applicable
+            if (functionResponse.isTruncated) {
+              contextMessage += `\n\n⚠️ NOTE: This document was truncated from ${functionResponse.originalLength.toLocaleString()} to 25,000 characters. If the answer is not found, inform the user and suggest they ask more specific questions.`;
+            }
+            
+            updatedMessages.push({
+              role: "user",
+              content: contextMessage,
+            });
+
             try {
               const docQueryResponse = await groq.chat.completions.create({
                 model: "llama-3.3-70b-versatile",
                 messages: updatedMessages,
                 max_tokens: 4096,
               });
+
               return new Response(
-                JSON.stringify({ message: { role: "assistant", content: docQueryResponse.choices[0].message.content, tool_used: functionName } }),
+                JSON.stringify({
+                  message: {
+                    role: "assistant",
+                    content: docQueryResponse.choices[0].message.content,
+                    tool_used: functionName,
+                  },
+                }),
                 { headers: { "Content-Type": "application/json" } }
               );
-            } catch (docError: unknown) {
-              if ((docError as { status?: number })?.status === 429) {
-                return new Response(JSON.stringify({ message: { role: "assistant", content: handleRateLimitError(docError) } }), { headers: { "Content-Type": "application/json" } });
+            } catch (docError: any) {
+              if (docError.status === 429) {
+                return new Response(
+                  JSON.stringify({
+                    message: {
+                      role: "assistant",
+                      content: handleRateLimitError(docError),
+                    },
+                  }),
+                  { headers: { "Content-Type": "application/json" } }
+                );
               }
               throw docError;
             }
           } else {
             return new Response(
-              JSON.stringify({ message: { role: "assistant", content: functionResponse, tool_used: functionName } }),
+              JSON.stringify({
+                message: {
+                  role: "assistant",
+                  content: functionResponse, // Error message
+                  tool_used: functionName,
+                },
+              }),
               { headers: { "Content-Type": "application/json" } }
             );
           }
         }
 
+        // ✅ 2. SYLLABUS & OTHERS: Append result to history (removed early return)
         updatedMessages.push({
           role: "tool",
           tool_call_id: toolCall.id,
-          content: typeof functionResponse === "string" ? functionResponse : JSON.stringify(functionResponse),
+          name: functionName,
+          content: typeof functionResponse === 'string' ? functionResponse : JSON.stringify(functionResponse),
         });
 
+        // ✅ 3. NEW: Enhanced study tips instruction for syllabus - GUARANTEED TOPICS DISPLAY
         if (functionName === "get_syllabus_from_pdf") {
-          const syllabusContent = typeof functionResponse === "string" ? functionResponse : "";
+          // Extract the formatted syllabus content from tool response
+          const syllabusContent = typeof functionResponse === 'string' ? functionResponse : '';
+          
           updatedMessages.push({
             role: "user",
-            content: `Here is the syllabus that was extracted. Display this EXACT content first, then add study tips below it:\n\n${syllabusContent}\n\nNow, after displaying the above syllabus content EXACTLY as shown (with all topics), add these study guide sections below a separator line (---):\n\n## 🧠 Smart Study Strategy\n- Analyze the topics listed and identify which ones are **conceptually challenging** vs **application-based**\n- Suggest which topics typically carry more **exam weightage** \n- Recommend the **ideal study sequence** for this unit\n\n## 💡 Key Focus Areas\n- List the **3-5 most important concepts** from the topics that students should master\n- Explain **why** each concept is crucial\n- Provide **real-world applications** where relevant\n\n## 📝 Practice Recommendations\n- Suggest **specific types of problems** students should practice based on the topics\n- Recommend **2-3 practice questions** based on the topics\n- Indicate difficulty level (Easy/Medium/Hard) for each\n\n## 🔄 Revision Strategy\n- Provide a **quick revision checklist** for this unit\n- Suggest **memory techniques** or **mnemonics** if applicable\n\n## ⏱️ Time Management\n- Suggest approximate **study hours** needed for each topic\n- Recommend a **week-long study plan** for this unit\n\nIMPORTANT: Start by showing the complete syllabus content above, then add the study sections. Make it motivating and student-friendly!`,
+            content: `Here is the syllabus that was extracted. Display this EXACT content first, then add study tips below it:
+
+${syllabusContent}
+
+Now, after displaying the above syllabus content EXACTLY as shown (with all topics), add these study guide sections below a separator line (---):
+
+## 🧠 Smart Study Strategy
+- Analyze the topics listed and identify which ones are **conceptually challenging** vs **application-based**
+- Suggest which topics typically carry more **exam weightage** 
+- Recommend the **ideal study sequence** for this unit
+
+## 💡 Key Focus Areas
+- List the **3-5 most important concepts** from the topics that students should master
+- Explain **why** each concept is crucial
+- Provide **real-world applications** where relevant
+
+## 📝 Practice Recommendations
+- Suggest **specific types of problems** students should practice based on the topics
+- Recommend **2-3 practice questions** based on the topics
+- Indicate difficulty level (Easy/Medium/Hard) for each
+
+## 🔄 Revision Strategy
+- Provide a **quick revision checklist** for this unit
+- Suggest **memory techniques** or **mnemonics** if applicable
+- Recommend how to **organize notes** for this unit
+
+## ⏱️ Time Management
+- Suggest approximate **study hours** needed for each topic
+- Recommend a **week-long study plan** for this unit
+
+IMPORTANT: Start by showing the complete syllabus content above, then add the study sections. Make it motivating and student-friendly!`
           });
         }
       }
 
+      // Second LLM call to incorporate tool results
       try {
         const secondResponse = await groq.chat.completions.create({
           model: "llama-3.3-70b-versatile",
           messages: updatedMessages,
         });
+
         return new Response(
-          JSON.stringify({ message: { ...secondResponse.choices[0].message, role: "assistant", tool_used: toolCalls[0].function.name } }),
+          JSON.stringify({
+            message: {
+              ...secondResponse.choices[0].message,
+              role: "assistant",
+              tool_used: toolCalls[0].function.name,
+            },
+          }),
           { headers: { "Content-Type": "application/json" } }
         );
-      } catch (secondError: unknown) {
-        if ((secondError as { status?: number })?.status === 429) {
-          return new Response(JSON.stringify({ message: { role: "assistant", content: handleRateLimitError(secondError) } }), { headers: { "Content-Type": "application/json" } });
+      } catch (secondError: any) {
+        if (secondError.status === 429) {
+          return new Response(
+            JSON.stringify({
+              message: {
+                role: "assistant",
+                content: handleRateLimitError(secondError),
+              },
+            }),
+            { headers: { "Content-Type": "application/json" } }
+          );
         }
         throw secondError;
       }
     } else {
-      return new Response(JSON.stringify({ message: responseMessage }), { headers: { "Content-Type": "application/json" } });
+      // No tool needed
+      return new Response(
+        JSON.stringify({ message: responseMessage }),
+        { headers: { "Content-Type": "application/json" } }
+      );
     }
-  } catch (error: unknown) {
-    logger.error("API Error:", error);
-    if ((error as { status?: number })?.status === 429) {
-      return new Response(JSON.stringify({ message: { role: "assistant", content: handleRateLimitError(error) } }), { headers: { "Content-Type": "application/json" } });
+  } catch (error: any) {
+    console.error("API Error:", error);
+    
+    // Handle rate limit errors
+    if (error.status === 429) {
+      return new Response(
+        JSON.stringify({
+          message: {
+            role: "assistant",
+            content: handleRateLimitError(error),
+          },
+        }),
+        { headers: { "Content-Type": "application/json" } }
+      );
     }
-    const message = error instanceof Error ? error.message : "Unknown error";
-    return errorResponse(`# ⚠️ Service Error\n\n**An unexpected error occurred while processing your request.**\n\n## 🔍 Error Details:\n\`${message}\`\n\n## 💡 What You Can Do:\n- **Wait a moment** and try again\n- **Simplify your question** if it was complex\n- **Contact support** if the issue persists\n\n**We apologize for the inconvenience!**`, 500);
+    
+    // Handle other errors
+    return new Response(
+      JSON.stringify({
+        message: {
+          role: "assistant",
+          content: `# ⚠️ Service Error
+
+**An unexpected error occurred while processing your request.**
+
+## 🔍 Error Details:
+\`${error.message || 'Unknown error'}\`
+
+## 💡 What You Can Do:
+- **Wait a moment** and try again
+- **Simplify your question** if it was complex
+- **Contact support** if the issue persists
+
+**We apologize for the inconvenience!**`,
+        },
+      }),
+      { 
+        status: 500,
+        headers: { "Content-Type": "application/json" } 
+      }
+    );
   }
+}
+
+// Helper function to handle rate limit errors
+function handleRateLimitError(error: any): string {
+  const errorMessage = error.error?.error?.message || error.message || '';
+  
+  // Extract wait time if available
+  let waitTime = '5-10 minutes';
+  const timeMatch = errorMessage.match(/try again in (.+?)\./i);
+  if (timeMatch) {
+    waitTime = timeMatch[1];
+  }
+  
+  return `# ⏳ Rate Limit Reached
+
+**Our AI service has reached its usage limit for today.**
+
+## 🔍 What Happened:
+The Groq API (our AI provider) has a daily token limit, and we've temporarily exceeded it.
+
+## ⏰ Wait Time:
+Please try again in **${waitTime}**
+
+## 💡 What You Can Do Right Now:
+
+### Option 1: Wait & Retry ⏱️
+- Come back in **${waitTime}**
+- Your question will work then
+- All your data is saved
+
+### Option 2: Use Basic Features 📚
+While waiting, you can still:
+- View the **college information** you already have
+- **Browse** previous conversation history
+- **Prepare questions** for when the service is back
+
+### Option 3: Contact Support 📞
+If this is urgent:
+- **Contact college IT support**
+- Mention the rate limit issue
+- They may have alternative access
+
+---
+
+## 📊 Technical Details:
+\`\`\`
+${errorMessage}
+\`\`\`
+
+**We apologize for the inconvenience! This is a temporary limit that will reset automatically.** 🙏
+
+💡 **Pro Tip:** Our service typically resets daily. Bookmark this chat and come back later!`;
 }

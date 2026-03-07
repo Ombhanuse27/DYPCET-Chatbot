@@ -11,11 +11,14 @@ const PDFJS_CONFIG = {
   disableAutoFetch: true,
 };
 
-// ✅ PRODUCTION FIX: workerSrc must be a plain string so PDF.js's internal
-// `.endsWith()` check doesn't throw. The value is never actually fetched
-// because disableWorker:true is passed to every getDocument() call, which
-// bypasses the worker entirely. This works on localhost and Vercel alike.
-pdfjsLib.GlobalWorkerOptions.workerSrc = 'pdf.worker.js';
+// ✅ PRODUCTION FIX: require.resolve() returns the real absolute path to the
+// worker file at runtime. This works because pdfjs-dist is marked as a server
+// external in next.config.js, so webpack does NOT bundle it — meaning
+// require.resolve() stays a proper Node.js call returning a string path,
+// not a webpack numeric module ID (which caused "e.endsWith is not a function").
+pdfjsLib.GlobalWorkerOptions.workerSrc = require.resolve(
+  'pdfjs-dist/legacy/build/pdf.worker.js'
+);
 // 📁 Store uploaded documents in memory (persisted globally across requests)
 declare global {
   var documentStore: Map<string, string> | undefined;

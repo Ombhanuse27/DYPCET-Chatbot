@@ -7,7 +7,7 @@ import { Pool } from "pg";
 // pdf-parse is a pure Node.js library with no workers, no webpack issues,
 // and works identically on localhost and Vercel production.
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-const pdfParse = require('pdf-parse/lib/pdf-parse.js');
+const pdfParse = require('pdf-parse');
 import fs from 'fs';
 import path from 'path';
 

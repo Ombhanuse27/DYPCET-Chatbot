@@ -1,24 +1,16 @@
 import Groq from "groq-sdk";
 import { Pool } from "pg";
-import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.js';
+// ✅ ONLY CHANGE: Replaced pdfjs-dist with pdf-parse.
+// pdfjs-dist uses a worker process that cannot be reliably bundled in
+// Next.js API routes on Vercel — causing "e.endsWith is not a function"
+// or "Cannot find module 'pdf.worker.js'" regardless of config workarounds.
+// pdf-parse is a pure Node.js library with no workers, no webpack issues,
+// and works identically on localhost and Vercel production.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const pdfParse = require('pdf-parse/lib/pdf-parse.js');
 import fs from 'fs';
 import path from 'path';
 
-// ✅ FIX: This prevents PDF.js from looking for the 'canvas' module in Node.js
-const PDFJS_CONFIG = {
-  disableRange: true,
-  disableStream: true,
-  disableAutoFetch: true,
-};
-
-// ✅ PRODUCTION FIX: require.resolve() returns the real absolute path to the
-// worker file at runtime. This works because pdfjs-dist is marked as a server
-// external in next.config.js, so webpack does NOT bundle it — meaning
-// require.resolve() stays a proper Node.js call returning a string path,
-// not a webpack numeric module ID (which caused "e.endsWith is not a function").
-pdfjsLib.GlobalWorkerOptions.workerSrc = require.resolve(
-  'pdfjs-dist/legacy/build/pdf.worker.js'
-);
 // 📁 Store uploaded documents in memory (persisted globally across requests)
 declare global {
   var documentStore: Map<string, string> | undefined;
@@ -46,46 +38,10 @@ const get_syllabus_from_pdf = async ({
       throw new Error(`Syllabus file not found at ${syllabusPath}`);
     }
 
-    const data = new Uint8Array(fs.readFileSync(syllabusPath));
-    const pdf = await pdfjsLib.getDocument({ data, disableWorker: true } as any).promise;
-
-    let fullText = '';
-    let pageTexts: string[] = [];
-    
-    // Extract text with better formatting preservation
-    for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-      const page = await pdf.getPage(pageNum);
-      const content = await page.getTextContent();
-      
-      // Sort items by vertical position to maintain reading order
-      const items = content.items.sort((a: any, b: any) => {
-        const yDiff = Math.abs(a.transform[5] - b.transform[5]);
-        if (yDiff > 5) return b.transform[5] - a.transform[5]; // Top to bottom
-        return a.transform[4] - b.transform[4]; // Left to right
-      });
-      
-      let currentY = -1;
-      let lineText = '';
-      let pageText = '';
-      
-      items.forEach((item: any) => {
-        const y = item.transform[5];
-        const text = item.str;
-        
-        // New line detection
-        if (currentY !== -1 && Math.abs(currentY - y) > 5) {
-          pageText += lineText.trim() + '\n';
-          lineText = '';
-        }
-        
-        lineText += text + ' ';
-        currentY = y;
-      });
-      
-      pageText += lineText.trim();
-      pageTexts.push(pageText);
-      fullText += pageText + '\n\n';
-    }
+    // ✅ CHANGE: was pdfjsLib multi-page loop, now a single pdf-parse call
+    const fileBuffer = fs.readFileSync(syllabusPath);
+    const pdfData = await pdfParse(fileBuffer);
+    const fullText = pdfData.text;
 
     console.log(`🔍 Searching for: "${subject}" - Unit ${unit}`);
 
@@ -211,12 +167,12 @@ const get_syllabus_from_pdf = async ({
       .slice(0, 2000); // Limit length
 
     // Try to extract topics/subtopics
-    const lines = cleanedContent.split(/[,;]/).filter(l => l.trim().length > 5);
+    const lines = cleanedContent.split(/[,;]/).filter((l: string) => l.trim().length > 5);
     
     let formattedContent = '';
     if (lines.length > 1) {
       formattedContent = '## 📚 Topics Covered:\n\n';
-      lines.forEach((line, idx) => {
+      lines.forEach((line: string, idx: number) => {
         const trimmedLine = line.trim();
         if (trimmedLine) {
           formattedContent += `${idx + 1}. ${trimmedLine}\n`;
@@ -266,46 +222,12 @@ function convertToRoman(num: string): string {
 }
 
 // 📄 Extract text from uploaded PDF
+// ✅ CHANGE: was pdfjsLib multi-page loop, now a single pdf-parse call
 async function extractTextFromPDF(base64Data: string): Promise<string> {
   try {
     const buffer = Buffer.from(base64Data, 'base64');
-    const data = new Uint8Array(buffer);
-    const pdf = await pdfjsLib.getDocument({ data, disableWorker: true } as any).promise;
-
-    let fullText = '';
-    
-    for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-      const page = await pdf.getPage(pageNum);
-      const content = await page.getTextContent();
-      
-      const items = content.items.sort((a: any, b: any) => {
-        const yDiff = Math.abs(a.transform[5] - b.transform[5]);
-        if (yDiff > 5) return b.transform[5] - a.transform[5];
-        return a.transform[4] - b.transform[4];
-      });
-      
-      let currentY = -1;
-      let lineText = '';
-      let pageText = `\n--- Page ${pageNum} ---\n`;
-      
-      items.forEach((item: any) => {
-        const y = item.transform[5];
-        const text = item.str;
-        
-        if (currentY !== -1 && Math.abs(currentY - y) > 5) {
-          pageText += lineText.trim() + '\n';
-          lineText = '';
-        }
-        
-        lineText += text + ' ';
-        currentY = y;
-      });
-      
-      pageText += lineText.trim();
-      fullText += pageText + '\n';
-    }
-
-    return fullText;
+    const pdfData = await pdfParse(buffer);
+    return pdfData.text;
   } catch (error: any) {
     throw new Error(`Failed to extract PDF text: ${error.message}`);
   }

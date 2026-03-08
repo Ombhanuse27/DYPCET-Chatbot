@@ -1,15 +1,9 @@
 import Groq from "groq-sdk";
 import { Pool } from "pg";
-// ✅ ONLY CHANGE: Replaced pdfjs-dist with pdf-parse.
-// pdfjs-dist uses a worker process that cannot be reliably bundled in
-// Next.js API routes on Vercel — causing "e.endsWith is not a function"
-// or "Cannot find module 'pdf.worker.js'" regardless of config workarounds.
-// pdf-parse is a pure Node.js library with no workers, no webpack issues,
-// and works identically on localhost and Vercel production.
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const pdfParse = require('pdf-parse');
+
 import fs from 'fs';
 import path from 'path';
+import { extractText } from 'unpdf';
 
 // 📁 Store uploaded documents in memory (persisted globally across requests)
 declare global {
@@ -24,25 +18,13 @@ const documentFileNameMap = global.documentFileNameMap ?? new Map<string, string
 global.documentStore = documentStore;
 global.documentFileNameMap = documentFileNameMap;
 
-const get_syllabus_from_pdf = async ({ 
-  subject, 
-  unit 
-}: { 
-  subject: string; 
-  unit: string 
-}) => {
+const get_syllabus_from_pdf = async ({ subject, unit }: { subject: string; unit: string }) => {
   try {
     const syllabusPath = path.join(process.cwd(), 'public/TY-CSE-syllabus.pdf');
-    
-    if (!fs.existsSync(syllabusPath)) {
-      throw new Error(`Syllabus file not found at ${syllabusPath}`);
-    }
+    if (!fs.existsSync(syllabusPath)) throw new Error(`Syllabus file not found`);
 
-    // ✅ CHANGE: was pdfjsLib multi-page loop, now a single pdf-parse call
-    const fileBuffer = fs.readFileSync(syllabusPath);
-    const pdfData = await pdfParse(fileBuffer);
-    const fullText = pdfData.text;
-
+    const buffer = new Uint8Array(fs.readFileSync(syllabusPath));
+    const { text: fullText } = await extractText(buffer, { mergePages: true });
     console.log(`🔍 Searching for: "${subject}" - Unit ${unit}`);
 
     // Normalize subject name for better matching
@@ -167,12 +149,12 @@ const get_syllabus_from_pdf = async ({
       .slice(0, 2000); // Limit length
 
     // Try to extract topics/subtopics
-    const lines = cleanedContent.split(/[,;]/).filter((l: string) => l.trim().length > 5);
+    const lines: string[] = cleanedContent.split(/[,;]/).filter((l: string) => l.trim().length > 5);
     
     let formattedContent = '';
     if (lines.length > 1) {
       formattedContent = '## 📚 Topics Covered:\n\n';
-      lines.forEach((line: string, idx: number) => {
+      lines.forEach((line, idx) => {
         const trimmedLine = line.trim();
         if (trimmedLine) {
           formattedContent += `${idx + 1}. ${trimmedLine}\n`;
@@ -222,15 +204,10 @@ function convertToRoman(num: string): string {
 }
 
 // 📄 Extract text from uploaded PDF
-// ✅ CHANGE: was pdfjsLib multi-page loop, now a single pdf-parse call
 async function extractTextFromPDF(base64Data: string): Promise<string> {
-  try {
-    const buffer = Buffer.from(base64Data, 'base64');
-    const pdfData = await pdfParse(buffer);
-    return pdfData.text;
-  } catch (error: any) {
-    throw new Error(`Failed to extract PDF text: ${error.message}`);
-  }
+  const buffer = new Uint8Array(Buffer.from(base64Data, 'base64'));
+  const { text } = await extractText(buffer, { mergePages: true });
+  return text;
 }
 
 // 📝 Extract text from TXT/MD files
